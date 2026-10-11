@@ -1350,7 +1350,15 @@ impl Event for OutputEvent {
 
 impl OutputEvent {
     fn update_fractional_scale<C: XConnection>(target: Entity, state: &mut ServerState<C>) {
-        if state.fractional_scale.is_none() {
+        // Only v3 commits logical size and wl_output mode/transform together.
+        // Older xdg.done batches cannot be paired reliably with wl_output.done,
+        // so retain their integer output scale instead of mixing generations.
+        if state.fractional_scale.is_none()
+            || !state
+                .world
+                .get::<&zxdg_output_v1::ZxdgOutputV1>(target)
+                .is_ok_and(|xdg| xdg.version() >= 3)
+        {
             return;
         }
         let factor = state
@@ -1486,15 +1494,7 @@ impl OutputEvent {
                 // A surface can overlap several outputs, and its preferred
                 // scale need not belong to the last output it entered. Derive
                 // global X11 DPI from output geometry, after its atomic batch.
-                if state
-                    .world
-                    .get::<&zxdg_output_v1::ZxdgOutputV1>(target)
-                    .is_ok()
-                {
-                    // Legacy xdg.done can precede wl.mode/geometry, so those
-                    // versions also need a refresh when the wl batch completes.
-                    Self::update_fractional_scale(target, state);
-                }
+                Self::update_fractional_scale(target, state);
                 state.world.get::<&WlOutput>(target).unwrap().done();
             }
             _ => simple_event_shunt! {
@@ -1541,20 +1541,10 @@ impl OutputEvent {
                     xdg.logical_size(dimensions.width, dimensions.height);
                 }
             }
-            Event::Done => {
-                // xdg-output v1/v2 terminate their batch here; v3 uses wl_output.done.
-                if state
-                    .world
-                    .get::<&zxdg_output_v1::ZxdgOutputV1>(target)
-                    .is_ok_and(|xdg| xdg.version() < 3)
-                {
-                    Self::update_fractional_scale(target, state);
-                }
-                state.world.get::<&XdgOutputServer>(target).unwrap().done();
-            }
             _ => simple_event_shunt! {
                 state.world.get::<&XdgOutputServer>(target).unwrap(),
                 event: zxdg_output_v1::Event => [
+                    Done,
                     Name { name },
                     Description { description }
                 ]
