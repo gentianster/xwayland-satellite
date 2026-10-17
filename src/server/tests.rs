@@ -4407,3 +4407,318 @@ fn popup_group_fallback_is_unambiguous_and_keeps_explicit_priority() {
     f.run();
     assert_eq!(f.satellite.popup_parent(popup, None), None);
 }
+
+// Replay only geometry/events captured from the live anomaly; no real browser.
+#[test]
+fn popup_coordinate_replay_keeps_parent_space_across_output_enter() {
+    let mut f = TestFixture::new_pre_connect(|wl| wl.enable_fractional_scale());
+    let comp = f.compositor();
+    f.new_output(2160, 0);
+    let (_, left) = f.new_output(0, 720);
+    let (_, right) = f.new_output(3440, 720);
+    f.run();
+    f.run();
+    let root = Window::new(1);
+    let (_, root_id) = f.create_toplevel(&comp, root);
+    f.testwl.move_surface_to_output(root_id, &left);
+    f.testwl
+        .get_surface_data(root_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .unwrap()
+        .preferred_scale(180);
+    f.run();
+    f.run();
+    assert_eq!(f.connection().window(root).dims.x, 0);
+    assert_eq!(f.connection().window(root).dims.y, 720);
+    let first = Window::new(2);
+    let (_, first_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(first, root, root_id)
+            .x(241)
+            .y(748)
+            .width(800)
+            .height(1412)
+            .scale(1.5),
+    );
+    f.testwl.move_surface_to_output(first_id, &right);
+    f.run();
+    f.run();
+    let a = f.connection().window(first).dims;
+    // Model the monitor-bound clamp suggested by the captured x=3440-800.
+    // This is an explicit client model, not a claim to execute Chromium code.
+    let requested_second_x = (a.x as i32 + a.width as i32).min(3440 - 800) as i16;
+    f.satellite.last_hovered = Some(root);
+    let second = Window::new(3);
+    let (_, second_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(second, root, root_id)
+            .x(requested_second_x)
+            .y(798)
+            .width(800)
+            .height(1317)
+            .scale(1.5),
+    );
+    f.testwl.move_surface_to_output(second_id, &right);
+    f.run();
+    f.run();
+    let b = f.connection().window(second).dims;
+    eprintln!(
+        "replay root={:?} first={a:?} request_second_x={requested_second_x} second={b:?} gap={}",
+        f.connection().window(root).dims,
+        b.x as i32 - a.x as i32 - a.width as i32
+    );
+    assert!(
+        (b.x as i32 - a.x as i32 - a.width as i32).abs() <= 2,
+        "popup output enter must not change its parent-relative X11 frame"
+    );
+}
+
+#[test]
+fn popup_coordinate_replay_preserves_nonzero_parent_origin() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    f.new_output(0, 0);
+    let (_, output) = f.new_output(500, 100);
+    let root = Window::new(1);
+    let (_, root_id) = f.create_toplevel(&comp, root);
+    f.testwl.move_surface_to_output(root_id, &output);
+    f.run();
+    f.run();
+    let first = Window::new(2);
+    let (_, first_id) =
+        f.create_popup(&comp, PopupBuilder::new(first, root, root_id).x(510).y(110));
+    // xdg_popup.configure is relative to the parent, even before output enter.
+    eprintln!(
+        "parent={:?}, popup={:?}",
+        f.connection().window(root).dims,
+        f.connection().window(first).dims
+    );
+    assert_eq!(f.connection().window(first).dims.x, 510);
+    assert_eq!(f.connection().window(first).dims.y, 110);
+    f.testwl.move_surface_to_output(first_id, &output);
+    f.run();
+    f.run();
+}
+
+#[test]
+fn popup_coordinates_signed_nested_parent_scale_and_output_relocation() {
+    let mut f = TestFixture::new_pre_connect(|wl| wl.enable_fractional_scale());
+    let comp = f.compositor();
+    f.new_output(0, 0);
+    let (_, output) = f.new_output(500, 100);
+    let root = Window::new(1);
+    let (_, root_id) = f.create_toplevel(&comp, root);
+    f.testwl.move_surface_to_output(root_id, &output);
+    f.testwl
+        .get_surface_data(root_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .unwrap()
+        .preferred_scale(180);
+    f.run();
+    f.run();
+    let first = Window::new(2);
+    let (_, first_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(first, root, root_id)
+            .x(470)
+            .y(70)
+            .width(90)
+            .height(90)
+            .scale(1.5),
+    );
+    assert_eq!(
+        (
+            f.connection().window(first).dims.x,
+            f.connection().window(first).dims.y
+        ),
+        (470, 70)
+    );
+    f.testwl.move_surface_to_output(first_id, &output);
+    // The parent's scale projects position; a different child scale sizes its viewport.
+    f.testwl
+        .get_surface_data(first_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .unwrap()
+        .preferred_scale(120);
+    f.run();
+    f.run();
+    let nested = Window::new(3);
+    let (_, nested_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(nested, first, first_id)
+            .transient_for(first)
+            .x(450)
+            .y(55)
+            .width(20)
+            .height(20),
+    );
+    f.testwl.move_surface_to_output(nested_id, &output);
+    f.run();
+    f.run();
+    assert_eq!(
+        (
+            f.connection().window(nested).dims.x,
+            f.connection().window(nested).dims.y
+        ),
+        (450, 55)
+    );
+    let wanted = WindowDims {
+        x: 515,
+        y: 115,
+        width: 90,
+        height: 90,
+    };
+    f.reconfigure_window(first, wanted, true);
+    f.run();
+    f.run();
+    let a = f.connection().window(first).dims;
+    assert_eq!((a.x, a.y), (515, 115));
+    // Its first parent has moved by (45,45), without a new nested configure.
+    let b = f.connection().window(nested).dims;
+    assert_eq!((b.x, b.y), (495, 100));
+    let data = f.testwl.get_surface_data(first_id).unwrap();
+    assert_eq!(
+        data.popup().positioner_state.offset,
+        testwl::Vec2 { x: 10, y: 10 }
+    );
+    // Output movement updates the root first and then every descendant once.
+    f.testwl.move_output(&output, 650, 250);
+    f.run();
+    f.run();
+    assert_eq!(
+        (
+            f.connection().window(root).dims.x,
+            f.connection().window(root).dims.y
+        ),
+        (650, 250)
+    );
+    assert_eq!(
+        (
+            f.connection().window(first).dims.x,
+            f.connection().window(first).dims.y
+        ),
+        (665, 265)
+    );
+    assert_eq!(
+        (
+            f.connection().window(nested).dims.x,
+            f.connection().window(nested).dims.y
+        ),
+        (645, 250)
+    );
+}
+
+#[test]
+fn popup_coordinates_parent_move_when_child_is_on_another_output() {
+    let mut f = TestFixture::new_pre_connect(|wl| wl.enable_fractional_scale());
+    let comp = f.compositor();
+    f.new_output(0, 0);
+    let (_, left) = f.new_output(500, 100);
+    let (_, right) = f.new_output(1500, 100);
+    let root = Window::new(1);
+    let (_, root_id) = f.create_toplevel(&comp, root);
+    f.testwl.move_surface_to_output(root_id, &left);
+    f.run();
+    f.run();
+    let child = Window::new(2);
+    let (_, child_id) =
+        f.create_popup(&comp, PopupBuilder::new(child, root, root_id).x(510).y(110));
+    f.testwl.move_surface_to_output(child_id, &right);
+    f.run();
+    f.run();
+    assert_eq!(
+        (
+            f.connection().window(child).dims.x,
+            f.connection().window(child).dims.y
+        ),
+        (510, 110)
+    );
+    f.testwl.move_output(&right, 1600, 200);
+    f.run();
+    f.run();
+    assert_eq!(
+        (
+            f.connection().window(child).dims.x,
+            f.connection().window(child).dims.y
+        ),
+        (510, 110)
+    );
+    f.testwl.move_output(&left, 650, 250);
+    f.run();
+    f.run();
+    assert_eq!(
+        (
+            f.connection().window(child).dims.x,
+            f.connection().window(child).dims.y
+        ),
+        (660, 260)
+    );
+    // A parent scale change must also update children without a new child configure.
+    f.testwl
+        .get_surface_data(root_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .unwrap()
+        .preferred_scale(240);
+    f.run();
+    f.run();
+    assert_eq!(
+        (
+            f.connection().window(child).dims.x,
+            f.connection().window(child).dims.y
+        ),
+        (670, 270)
+    );
+}
+
+#[test]
+fn popup_coordinates_output_move_and_configure_in_one_dispatch() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    f.new_output(0, 0);
+    let (_, output) = f.new_output(500, 100);
+    let root = Window::new(1);
+    let (_, root_id) = f.create_toplevel(&comp, root);
+    f.testwl.move_surface_to_output(root_id, &output);
+    f.run();
+    f.run();
+    let child = Window::new(2);
+    let (_, child_id) =
+        f.create_popup(&comp, PopupBuilder::new(child, root, root_id).x(510).y(110));
+    f.testwl.move_surface_to_output(child_id, &output);
+    f.run();
+    f.run();
+    for configure_first in [true, false] {
+        if configure_first {
+            f.testwl.configure_toplevel(root_id, 80, 80, vec![]);
+        }
+        f.testwl.move_output(&output, 650, 250);
+        if !configure_first {
+            f.testwl.configure_toplevel(root_id, 80, 80, vec![]);
+        }
+        f.run();
+        f.run();
+        assert_eq!(
+            (
+                f.connection().window(root).dims.x,
+                f.connection().window(root).dims.y
+            ),
+            (650, 250)
+        );
+        assert_eq!(
+            (
+                f.connection().window(child).dims.x,
+                f.connection().window(child).dims.y
+            ),
+            (660, 260)
+        );
+        f.testwl.move_output(&output, 500, 100);
+        f.run();
+        f.run();
+    }
+}

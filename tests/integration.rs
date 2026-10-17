@@ -359,6 +359,10 @@ impl Fixture {
             .unwrap()
             .logical_size(1000, 1000);
         output.done();
+        self.dispatch_until_quiet();
+    }
+
+    fn dispatch_until_quiet(&mut self) {
         // An output-only DPI update can finish through X11 properties without
         // producing another Wayland request while no surfaces are mapped.
         self.testwl.dispatch();
@@ -2566,4 +2570,44 @@ fn client_minimize() {
 
     f.wait_and_dispatch();
     assert!(f.testwl.get_surface_data(surface).unwrap().minimized);
+}
+
+#[test]
+fn popup_parent_frame_survives_mixed_output_enter() {
+    let mut f = Fixture::new_preset(|wl| wl.enable_fractional_scale());
+    f.testwl.enable_xdg_output_manager();
+    f.create_output(2160, 0);
+    let left = f.create_output(0, 720);
+    let right = f.create_output(3440, 720);
+    f.set_fractional_output_scale(&right, 1.5);
+    let mut conn = Connection::new(&f.display);
+    let root = conn.new_window(conn.root, 0, 0, 2961, 1852, false);
+    let root_id = f.map_as_toplevel(&mut conn, root);
+    f.testwl.move_surface_to_output(root_id, &left);
+    f.testwl
+        .get_surface_data(root_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .unwrap()
+        .preferred_scale(180);
+    f.dispatch_until_quiet();
+    let first = conn.new_window(conn.root, 241, 748, 800, 1412, true);
+    let first_id = f.map_as_popup(&mut conn, first);
+    f.testwl.move_surface_to_output(first_id, &right);
+    f.dispatch_until_quiet();
+    let a = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(first),
+    });
+    assert_eq!((a.x(), a.y(), a.width(), a.height()), (240, 747, 799, 1411));
+    let next_x = (a.x() as i32 + a.width() as i32).min(3440 - 800) as i16;
+    let second = conn.new_window(conn.root, next_x, 798, 800, 1317, true);
+    let second_id = f.map_as_popup(&mut conn, second);
+    f.testwl.move_surface_to_output(second_id, &right);
+    f.dispatch_until_quiet();
+    let b = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(second),
+    });
+    assert!((b.x() as i32 - a.x() as i32 - a.width() as i32).abs() <= 2);
+    assert_eq!(conn.get_xsettings().data["Xft/DPI"].value, 96 * 1024);
 }

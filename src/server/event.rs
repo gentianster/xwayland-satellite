@@ -303,6 +303,8 @@ impl SurfaceEvents {
                             x: dimensions.x - state.global_output_offset.x.value,
                             y: dimensions.y - state.global_output_offset.y.value,
                         },
+                        data.get::<&SurfaceRole>()
+                            .is_some_and(|role| matches!(*role, SurfaceRole::Popup(_))),
                         connection,
                     );
                     if state.last_focused_toplevel == Some(*window) {
@@ -355,6 +357,11 @@ impl SurfaceEvents {
         };
 
         let data = state.world.entity(target).unwrap();
+        let popup_parent = data.get::<&SurfaceRole>().and_then(|role| match &*role {
+            SurfaceRole::Popup(Some(popup)) => Some(popup.parent),
+            _ => None,
+        });
+        let parent_frame = popup_parent.and_then(|parent| state.window_frame(parent));
         let mut xdg = hecs::RefMut::map(data.get::<&mut SurfaceRole>().unwrap(), |r| {
             r.xdg_mut().unwrap()
         });
@@ -365,12 +372,31 @@ impl SurfaceEvents {
         drop(xdg);
 
         if let Some(pending) = pending {
+            if let Some(SurfaceRole::Popup(Some(popup))) =
+                data.get::<&mut SurfaceRole>().as_deref_mut()
+            {
+                popup.position = Some((pending.x, pending.y));
+            }
             let mut query = data.query::<(&SurfaceScaleFactor, &x::Window, &mut WindowData)>();
             let (scale_factor, window, window_data) = query.get().unwrap();
 
             let window = *window;
-            let x = (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x;
-            let y = (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y;
+            let (x, y) = if let Some((parent_dims, parent_scale)) = parent_frame {
+                (
+                    parent_dims.x as i32 + (pending.x as f64 * parent_scale) as i32,
+                    parent_dims.y as i32 + (pending.y as f64 * parent_scale) as i32,
+                )
+            } else if popup_parent.is_some() {
+                (
+                    window_data.attrs.dims.x as i32,
+                    window_data.attrs.dims.y as i32,
+                )
+            } else {
+                (
+                    (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x,
+                    (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y,
+                )
+            };
             let width = if pending.width > 0 {
                 (pending.width as f64 * scale_factor.0) as u16
             } else {
@@ -1255,11 +1281,11 @@ fn update_window_output_offsets(
     let Ok(dimensions) = world.get::<&OutputDimensions>(output) else {
         return;
     };
-    let mut query = world.query::<(&x::Window, &mut WindowData, &OnOutput)>();
+    let mut query = world.query::<(&x::Window, &mut WindowData, &OnOutput, Option<&SurfaceRole>)>();
 
-    for (_, (window, data, _)) in query
+    for (_, (window, data, _, role)) in query
         .into_iter()
-        .filter(|(_, (_, _, on_output))| on_output.0 == output)
+        .filter(|(_, (_, _, on_output, _))| on_output.0 == output)
     {
         data.update_output_offset(
             *window,
@@ -1267,6 +1293,7 @@ fn update_window_output_offsets(
                 x: dimensions.x - global_output_offset.x.value,
                 y: dimensions.y - global_output_offset.y.value,
             },
+            role.is_some_and(|role| matches!(role, SurfaceRole::Popup(_))),
             connection,
         );
     }

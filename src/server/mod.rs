@@ -157,10 +157,18 @@ impl WindowData {
         &mut self,
         window: x::Window,
         offset: WindowOutputOffset,
+        parent_relative: bool,
         connection: &mut C,
     ) {
         log::trace!(target: "output_offset", "offset: {offset:?}");
         if offset == self.output_offset {
+            return;
+        }
+
+        // Popup coordinates belong to their parent's X11 frame. Their own
+        // output may differ while crossing a monitor boundary.
+        if parent_relative {
+            self.output_offset = offset;
             return;
         }
 
@@ -251,6 +259,8 @@ struct ToplevelData {
 #[derive(Debug)]
 struct PopupData {
     parent: x::Window,
+    // Last compositor-confirmed offset in the parent's logical coordinates.
+    position: Option<(i32, i32)>,
     popup: XdgPopup,
     positioner: XdgPositioner,
     xdg: XdgSurfaceData,
@@ -676,18 +686,6 @@ impl<C: XConnection> ServerState<C> {
             event.handle(target, self);
         }
 
-        let query = self.world.query_mut::<(&x::Window, &PendingSurfaceState)>();
-        let iter = query
-            .into_iter()
-            .map(|(e, (win, dims))| (e, (*win, *dims)))
-            .collect::<Vec<_>>();
-        for (entity, (win, dims)) in iter.into_iter() {
-            self.connection.set_window_dims(win, dims);
-            self.world
-                .remove_one::<PendingSurfaceState>(entity)
-                .unwrap();
-        }
-
         if self.global_output_offset.x.owner.is_none()
             || self.global_output_offset.y.owner.is_none()
         {
@@ -771,6 +769,34 @@ impl<C: XConnection> ServerState<C> {
             }
         }
 
+        self.sync_popup_coordinates();
+        let pending = self
+            .world
+            .query_mut::<(&x::Window, &WindowData, &PendingSurfaceState)>()
+            .into_iter()
+            .map(|(entity, (window, data, _))| {
+                // Output events in this dispatch may have updated the frame
+                // after xdg.configure queued its original geometry.
+                let dims = data.attrs.dims;
+                (
+                    entity,
+                    *window,
+                    PendingSurfaceState {
+                        x: dims.x as i32,
+                        y: dims.y as i32,
+                        width: dims.width as i32,
+                        height: dims.height as i32,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        for (entity, window, dims) in pending {
+            self.connection.set_window_dims(window, dims);
+            self.world
+                .remove_one::<PendingSurfaceState>(entity)
+                .unwrap();
+        }
+
         {
             if let Some(FocusData {
                 window,
@@ -847,6 +873,69 @@ impl<C: XConnection> ServerState<C> {
 }
 
 impl<S: X11Selection + 'static> InnerServerState<S> {
+    fn window_frame(&self, window: x::Window) -> Option<(WindowDims, f64)> {
+        let entity = *self.windows.get(&window)?;
+        let data = self.world.get::<&WindowData>(entity).ok()?;
+        let scale = self.world.get::<&SurfaceScaleFactor>(entity).ok()?;
+        Some((data.attrs.dims, scale.0))
+    }
+
+    fn sync_popup_coordinates(&mut self) {
+        let mut remaining = self
+            .world
+            .query::<(&x::Window, &SurfaceRole)>()
+            .iter()
+            .filter_map(|(entity, (window, role))| {
+                let SurfaceRole::Popup(Some(popup)) = role else {
+                    return None;
+                };
+                Some((entity, *window, popup.parent, popup.position?))
+            })
+            .collect::<Vec<_>>();
+        // A popup can parent another popup. Resolve parent frames before their
+        // descendants, independent of the ECS or output iteration order.
+        while !remaining.is_empty() {
+            let parents = remaining
+                .iter()
+                .map(|(_, window, _, _)| *window)
+                .collect::<HashSet<_>>();
+            let before = remaining.len();
+            remaining.retain(|(entity, _, parent, position)| {
+                if parents.contains(parent) {
+                    return true;
+                }
+                let Some((parent_dims, parent_scale)) = self.window_frame(*parent) else {
+                    return false;
+                };
+                let x = parent_dims.x as i32 + (position.0 as f64 * parent_scale) as i32;
+                let y = parent_dims.y as i32 + (position.1 as f64 * parent_scale) as i32;
+                let mut data = self.world.get::<&mut WindowData>(*entity).unwrap();
+                if (data.attrs.dims.x as i32, data.attrs.dims.y as i32) != (x, y) {
+                    data.attrs.dims.x = x as i16;
+                    data.attrs.dims.y = y as i16;
+                    let dims = data.attrs.dims;
+                    drop(data);
+                    self.world
+                        .insert_one(
+                            *entity,
+                            PendingSurfaceState {
+                                x,
+                                y,
+                                width: dims.width as i32,
+                                height: dims.height as i32,
+                            },
+                        )
+                        .unwrap();
+                }
+                false
+            });
+            if remaining.len() == before {
+                warn!("Cannot resolve cyclic popup coordinate parents");
+                break;
+            }
+        }
+    }
+
     pub fn clientside_fd(&self) -> BorrowedFd<'_> {
         self.queue.as_fd()
     }
@@ -1110,7 +1199,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
     pub fn reconfigure_window(&mut self, event: x::ConfigureNotifyEvent) {
         // Read the parent's origin before borrowing this window's archetype mutably.
-        let popup_parent_dims = self
+        let popup_parent_frame = self
             .windows
             .get(&event.window())
             .and_then(|id| self.world.get::<&SurfaceRole>(*id).ok())
@@ -1118,9 +1207,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 SurfaceRole::Popup(Some(popup)) => Some(popup.parent),
                 _ => None,
             })
-            .and_then(|parent| self.windows.get(&parent))
-            .and_then(|id| self.world.get::<&WindowData>(*id).ok())
-            .map(|parent| parent.attrs.dims);
+            .and_then(|parent| self.window_frame(parent));
         let Some((mut win, data)) = self
             .windows
             .get(&event.window())
@@ -1162,19 +1249,22 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         match role {
             SurfaceRole::Popup(Some(popup)) => {
-                let Some(parent_dims) = popup_parent_dims else {
+                let Some((parent_dims, parent_scale)) = popup_parent_frame else {
                     warn!("Not repositioning popup with a destroyed parent");
                     return;
                 };
                 popup.positioner.set_offset(
-                    ((event.x() as i32 - parent_dims.x as i32) as f64 / scale_factor.0) as i32,
-                    ((event.y() as i32 - parent_dims.y as i32) as f64 / scale_factor.0) as i32,
+                    ((event.x() as i32 - parent_dims.x as i32) as f64 / parent_scale) as i32,
+                    ((event.y() as i32 - parent_dims.y as i32) as f64 / parent_scale) as i32,
                 );
                 popup.positioner.set_size(
                     1.max((event.width() as f64 / scale_factor.0) as i32),
                     1.max((event.height() as f64 / scale_factor.0) as i32),
                 );
                 popup.popup.reposition(&popup.positioner, 0);
+                // Wait for the compositor's constrained position before
+                // projecting this new client request back to X11.
+                popup.position = None;
             }
             SurfaceRole::Toplevel(Some(_)) => {
                 win.attrs.dims.width = dims.width;
@@ -1788,8 +1878,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             1.max((window.attrs.dims.width as f64 / initial_scale) as i32),
             1.max((window.attrs.dims.height as f64 / initial_scale) as i32),
         );
-        let x = ((window.attrs.dims.x - parent_dims.x) as f64 / initial_scale) as i32;
-        let y = ((window.attrs.dims.y - parent_dims.y) as f64 / initial_scale) as i32;
+        let x = ((window.attrs.dims.x as i32 - parent_dims.x as i32) as f64 / initial_scale) as i32;
+        let y = ((window.attrs.dims.y as i32 - parent_dims.y as i32) as f64 / initial_scale) as i32;
         positioner.set_offset(x, y);
         positioner.set_anchor(Anchor::TopLeft);
         positioner.set_gravity(Gravity::BottomRight);
@@ -1810,6 +1900,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         PopupData {
             parent,
+            position: None,
             popup,
             positioner,
             xdg: XdgSurfaceData {
