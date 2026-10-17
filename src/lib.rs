@@ -38,11 +38,47 @@ pub trait X11Selection {
 type EarlyServerState = ServerState<NoConnection<<RealConnection as XConnection>::X11Selection>>;
 type RealServerState = ServerState<RealConnection>;
 
+/// Optional compositor scaling; disabled for existing embedders by default.
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
+pub struct ScalingConfig {
+    pub enabled: bool,
+    /// None selects the largest connected output scale. Fixed values are
+    /// clamped to 1..=8 and non-finite values are ignored.
+    pub base_scale: Option<f64>,
+}
+
+impl ScalingConfig {
+    pub fn from_env() -> Self {
+        Self::from_values(
+            std::env::var("XWAYLAND_SATELLITE_COMPOSITOR_SCALING")
+                .ok()
+                .as_deref(),
+            std::env::var("XWAYLAND_SATELLITE_BASE_SCALE")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_values(enabled: Option<&str>, base: Option<&str>) -> Self {
+        let enabled = enabled.is_some_and(|v| !v.is_empty() && !["0", "off", "false"].contains(&v));
+        Self {
+            enabled,
+            base_scale: base
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(1.0, 8.0)),
+        }
+    }
+}
+
 pub trait RunData {
     fn display(&self) -> Option<&str>;
     fn listenfds(&mut self) -> Vec<OwnedFd>;
     fn flags(&self) -> &[String] {
         &[]
+    }
+    fn scaling_config(&self) -> ScalingConfig {
+        ScalingConfig::default()
     }
     fn server(&self) -> Option<UnixStream> {
         None
@@ -194,7 +230,8 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         }
     };
 
-    let mut server_state = EarlyServerState::new(dh, data.server(), connection);
+    let mut server_state =
+        EarlyServerState::with_scaling(dh, data.server(), connection, data.scaling_config());
     server_state.run();
 
     // Remove the lifetimes on our fds to avoid borrowing issues, since we know they will exist for

@@ -23,6 +23,7 @@ use xwls::timespec_from_millis;
 
 #[derive(Default)]
 struct TestDataInner {
+    scaling: xwls::ScalingConfig,
     server_created: AtomicBool,
     server_connected: AtomicBool,
     display: Mutex<Option<String>>,
@@ -35,8 +36,9 @@ struct TestDataInner {
 struct TestData(Arc<TestDataInner>);
 
 impl TestData {
-    fn new(server: UnixStream, quit_rx: UnixStream) -> Self {
+    fn new(server: UnixStream, quit_rx: UnixStream, scaling: xwls::ScalingConfig) -> Self {
         Self(Arc::new(TestDataInner {
+            scaling,
             server: Mutex::new(server.into()),
             quit_rx: Mutex::new(Some(quit_rx)),
             ..Default::default()
@@ -52,6 +54,9 @@ impl std::ops::Deref for TestData {
 }
 
 impl xwls::RunData for TestData {
+    fn scaling_config(&self) -> xwls::ScalingConfig {
+        self.scaling
+    }
     fn created_server(&self) {
         self.server_created.store(true, Ordering::Relaxed);
     }
@@ -123,6 +128,12 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new_preset(pre_connect: impl FnOnce(&mut testwl::Server)) -> Self {
+        Self::new_scaled(pre_connect, Default::default())
+    }
+    fn new_scaled(
+        pre_connect: impl FnOnce(&mut testwl::Server),
+        scaling: xwls::ScalingConfig,
+    ) -> Self {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             pretty_env_logger::formatted_timed_builder()
@@ -138,7 +149,7 @@ impl Fixture {
         let mut testwl = testwl::Server::new(false);
         pre_connect(&mut testwl);
         testwl.connect(a);
-        let our_data = TestData::new(b, quit_rx);
+        let our_data = TestData::new(b, quit_rx, scaling);
         let data = our_data.clone();
         let thread = std::thread::spawn(move || xwls::main(data));
 
@@ -203,14 +214,16 @@ impl Fixture {
     fn wait_and_dispatch(&mut self) {
         let mut pollfd = [self.pollfd.clone()];
         self.testwl.dispatch();
-        let timeout = timespec_from_millis(50);
+        // Startup/build load must not turn a valid asynchronous roundtrip
+        // into a 50ms scheduling race. Keep the idle drain short afterward.
+        let initial_timeout = timespec_from_millis(1000);
         assert!(
-            poll(&mut pollfd, Some(&timeout)).unwrap() > 0,
+            poll(&mut pollfd, Some(&initial_timeout)).unwrap() > 0,
             "Did not receive any events"
         );
         self.pollfd.clear_revents();
         self.testwl.dispatch();
-
+        let timeout = timespec_from_millis(50);
         while poll(&mut pollfd, Some(&timeout)).unwrap() > 0 {
             self.testwl.dispatch();
             self.pollfd.clear_revents();
@@ -2610,4 +2623,119 @@ fn popup_parent_frame_survives_mixed_output_enter() {
     });
     assert!((b.x() as i32 - a.x() as i32 - a.width() as i32).abs() <= 2);
     assert_eq!(conn.get_xsettings().data["Xft/DPI"].value, 96 * 1024);
+}
+
+// Real Xwayland, with the three physical/logical monitor geometries in use.
+// X11 output dimensions and local input are both logical units multiplied by B.
+fn mixed_scaling_roundtrip(base: Option<f64>) {
+    let b = base.unwrap_or(1.5);
+    let mut f = Fixture::new_scaled(
+        |wl| wl.enable_fractional_scale(),
+        xwls::ScalingConfig {
+            enabled: true,
+            base_scale: base,
+        },
+    );
+    f.testwl.enable_xdg_output_manager();
+    let mut outputs = Vec::new();
+    for (x, y, w, h, lw, lh, integer) in [
+        (0, 720, 3440, 1440, 3440, 1440, 1),
+        (3440, 720, 3840, 2160, 2560, 1440, 2),
+        (2160, 0, 1920, 1080, 1280, 720, 2),
+    ] {
+        let output = f.create_output(x, y);
+        f.dispatch_until_quiet();
+        output.mode(wl_output::Mode::Current, w, h, 144000);
+        output.scale(integer);
+        f.testwl
+            .get_xdg_output(&output)
+            .expect("xdg output bound")
+            .logical_size(lw, lh);
+        output.done();
+        f.dispatch_until_quiet();
+        outputs.push(output);
+    }
+    let mut conn = Connection::new(&f.display);
+    assert_eq!(
+        conn.get_xsettings().data["Xft/DPI"].value,
+        (96.0 * 1024.0 * b) as i32
+    );
+    let root = conn.new_window(conn.root, 0, 0, 200, 160, false);
+    let root_id = f.map_as_toplevel_with_scale(&mut conn, root, b as f32);
+    for output in &outputs {
+        f.testwl.move_surface_to_output(root_id, output);
+        f.testwl
+            .get_surface_data(root_id)
+            .unwrap()
+            .fractional
+            .as_ref()
+            .unwrap()
+            .preferred_scale(120);
+        f.testwl.move_pointer_to(root_id, 24.0, 30.0);
+        f.dispatch_until_quiet();
+        let ptr = conn.get_reply(&x::QueryPointer { window: root });
+        assert!(ptr.same_screen());
+        assert_eq!(
+            (ptr.win_x(), ptr.win_y()),
+            ((24.0 * b) as i16, (30.0 * b) as i16)
+        );
+        assert_eq!(
+            conn.get_xsettings().data["Xft/DPI"].value,
+            (96.0 * 1024.0 * b) as i32
+        );
+    }
+    f.testwl.move_surface_to_output(root_id, &outputs[1]);
+    f.dispatch_until_quiet();
+    f.testwl
+        .configure_toplevel(root_id, 240, 180, vec![xdg_toplevel::State::Activated]);
+    f.dispatch_until_quiet();
+    let geo = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(root),
+    });
+    assert_eq!(
+        (geo.width(), geo.height()),
+        ((240.0 * b) as u16, (180.0 * b) as u16)
+    );
+    let px = (3440.0 * b) as i16 - 30;
+    let py = (720.0 * b) as i16 - 30;
+    let first = conn.new_window(conn.root, px, py, 90, 90, true);
+    conn.set_property(first, x::ATOM_WINDOW, conn.atoms.transient_for, &[root]);
+    let first_id = f.map_as_popup(&mut conn, first);
+    f.testwl.move_surface_to_output(first_id, &outputs[0]);
+    f.dispatch_until_quiet();
+    let a = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(first),
+    });
+    assert_eq!((a.x(), a.y()), (px, py));
+    let nested = conn.new_window(conn.root, px - 15, py - 15, 30, 30, true);
+    conn.set_property(nested, x::ATOM_WINDOW, conn.atoms.transient_for, &[first]);
+    let nested_id = f.map_as_popup(&mut conn, nested);
+    f.testwl.move_surface_to_output(nested_id, &outputs[2]);
+    f.dispatch_until_quiet();
+    let child = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(nested),
+    });
+    assert_eq!((child.x(), child.y()), (px - 15, py - 15));
+    // Removing the high DPI monitors changes only auto B; fixed B stays fixed.
+    f.testwl.remove_output(outputs.pop().unwrap());
+    f.dispatch_until_quiet();
+    f.testwl.remove_output(outputs.pop().unwrap());
+    f.dispatch_until_quiet();
+    let final_b = base.unwrap_or(1.0);
+    assert_eq!(
+        conn.get_xsettings().data["Xft/DPI"].value,
+        (96.0 * 1024.0 * final_b) as i32
+    );
+}
+#[test]
+fn compositor_scaling_fixed_one_mixed_input_popup_resize() {
+    mixed_scaling_roundtrip(Some(1.0));
+}
+#[test]
+fn compositor_scaling_fixed_fractional_mixed_input_popup_resize() {
+    mixed_scaling_roundtrip(Some(1.5));
+}
+#[test]
+fn compositor_scaling_auto_max_mixed_input_popup_resize() {
+    mixed_scaling_roundtrip(None);
 }

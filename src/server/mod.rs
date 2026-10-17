@@ -510,6 +510,8 @@ pub struct InnerServerState<S: X11Selection> {
     updated_outputs: Vec<Entity>,
     new_scale: Option<f64>,
     current_scale: f64,
+    scaling_config: crate::ScalingConfig,
+    scaled_outputs_dirty: bool,
     cursor_shape_manager: Option<WpCursorShapeManagerV1>,
     /// Cursor-shape equivalent of the X cursor currently displayed, from its
     /// XFixes name. `None` when it has no name or no equivalent.
@@ -518,9 +520,23 @@ pub struct InnerServerState<S: X11Selection> {
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
     pub fn new(
+        dh: DisplayHandle,
+        server_connection: Option<UnixStream>,
+        client: UnixStream,
+    ) -> Self {
+        Self::with_scaling(
+            dh,
+            server_connection,
+            client,
+            crate::ScalingConfig::default(),
+        )
+    }
+
+    pub fn with_scaling(
         mut dh: DisplayHandle,
         server_connection: Option<UnixStream>,
         client: UnixStream,
+        scaling_config: crate::ScalingConfig,
     ) -> Self {
         let connection = {
             let _env = crate::env_read_guard();
@@ -633,6 +649,8 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             updated_outputs: Vec::new(),
             new_scale: None,
             current_scale: 1.0,
+            scaling_config,
+            scaled_outputs_dirty: false,
             cursor_shape_manager,
             x_cursor_shape: None,
             decoration_manager,
@@ -676,6 +694,7 @@ impl<C: XConnection> ServerState<C> {
     }
 
     pub fn handle_clientside_events(&mut self) {
+        let previous_base = self.current_scale;
         self.handle_globals();
 
         for (target, event) in self.world.read_events() {
@@ -699,7 +718,12 @@ impl<C: XConnection> ServerState<C> {
                 self.global_output_offset.x.value, self.global_output_offset.y.value
             );
             let state = &self.inner;
-            for (e, _) in state.world.query::<&WlOutput>().iter() {
+            for (e, _) in state
+                .world
+                .query::<&WlOutput>()
+                .iter()
+                .filter(|_| !state.scaling_config.enabled)
+            {
                 event::update_global_output_offset(
                     e,
                     &state.global_output_offset,
@@ -708,9 +732,14 @@ impl<C: XConnection> ServerState<C> {
                 );
             }
             self.global_offset_updated = false;
+            if self.scaling_config.enabled {
+                self.scaled_outputs_dirty = true;
+            }
         }
 
-        if !self.updated_outputs.is_empty() {
+        if !self.updated_outputs.is_empty()
+            && (!self.scaling_config.enabled || event::scaled_output_batches_ready(&self.world))
+        {
             for output in std::mem::take(&mut self.updated_outputs).iter() {
                 let Ok(output_scale) = self.world.get::<&OutputScaleFactor>(*output) else {
                     continue;
@@ -718,6 +747,7 @@ impl<C: XConnection> ServerState<C> {
                 // Integer fallback controls global DPI, not a surface's
                 // fractional preference (or its initial scale before one arrives).
                 if self.fractional_scale.is_none()
+                    && !self.scaling_config.enabled
                     && matches!(*output_scale, OutputScaleFactor::Output(..))
                 {
                     let mut surface_query = self
@@ -746,6 +776,7 @@ impl<C: XConnection> ServerState<C> {
             let mut mixed_scale = false;
             let mut scale;
 
+            let scaling_enabled = self.scaling_config.enabled;
             let mut outputs = self.world.query_mut::<&OutputScaleFactor>().into_iter();
             if let Some((_, output_scale)) = outputs.next() {
                 scale = output_scale.get();
@@ -753,22 +784,44 @@ impl<C: XConnection> ServerState<C> {
                 for (_, output_scale) in outputs {
                     if output_scale.get() != scale {
                         mixed_scale = true;
-                        scale = scale.min(output_scale.get());
+                        scale = if scaling_enabled {
+                            scale.max(output_scale.get())
+                        } else {
+                            scale.min(output_scale.get())
+                        };
                     }
                 }
 
                 if mixed_scale {
                     warn!(
-                        "Mixed output scales detected, choosing to give apps the smallest detected scale ({scale}x)"
+                        "Mixed output scales detected, selected output DPI basis {scale}x (compositor scaling: {scaling_enabled})"
                     );
                 }
 
+                if self.scaling_config.enabled {
+                    scale = self
+                        .scaling_config
+                        .base_scale
+                        .filter(|v| v.is_finite())
+                        .map(|v| v.clamp(1.0, 8.0))
+                        .unwrap_or(scale);
+                }
                 debug!("Using new scale {scale}");
                 self.new_scale = Some(scale);
                 self.current_scale = scale;
             }
         }
 
+        if self.scaling_config.enabled {
+            if self.current_scale != previous_base {
+                self.rescale_x11_surfaces(previous_base);
+                self.refresh_scaled_inputs();
+                self.scaled_outputs_dirty = true;
+            }
+            if self.scaled_outputs_dirty && event::refresh_scaled_outputs(self) {
+                self.scaled_outputs_dirty = false;
+            }
+        }
         self.sync_popup_coordinates();
         let pending = self
             .world
@@ -873,6 +926,45 @@ impl<C: XConnection> ServerState<C> {
 }
 
 impl<S: X11Selection + 'static> InnerServerState<S> {
+    fn rescale_x11_surfaces(&mut self, previous_base: f64) {
+        let ratio = self.current_scale / previous_base;
+        let entities = self
+            .world
+            .query::<(&SurfaceScaleFactor, &client::wl_surface::WlSurface)>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect::<Vec<_>>();
+        for entity in entities {
+            self.world.get::<&mut SurfaceScaleFactor>(entity).unwrap().0 = self.current_scale;
+            let pending = if let Ok(mut data) = self.world.get::<&mut WindowData>(entity) {
+                let dims = &mut data.attrs.dims;
+                dims.x = (dims.x as f64 * ratio).round() as i16;
+                dims.y = (dims.y as f64 * ratio).round() as i16;
+                dims.width = (dims.width as f64 * ratio)
+                    .round()
+                    .clamp(1.0, u16::MAX as f64) as u16;
+                dims.height = (dims.height as f64 * ratio)
+                    .round()
+                    .clamp(1.0, u16::MAX as f64) as u16;
+                let dims = *dims;
+                data.output_offset.x = (data.output_offset.x as f64 * ratio).round() as i32;
+                data.output_offset.y = (data.output_offset.y as f64 * ratio).round() as i32;
+                Some(PendingSurfaceState {
+                    x: dims.x as i32,
+                    y: dims.y as i32,
+                    width: dims.width as i32,
+                    height: dims.height as i32,
+                })
+            } else {
+                None
+            };
+            if let Some(pending) = pending {
+                self.world.insert_one(entity, pending).unwrap();
+                update_surface_viewport(&self.world, self.world.query_one(entity).unwrap());
+            }
+        }
+    }
+
     fn window_frame(&self, window: x::Window) -> Option<(WindowDims, f64)> {
         let entity = *self.windows.get(&window)?;
         let data = self.world.get::<&WindowData>(entity).ok()?;

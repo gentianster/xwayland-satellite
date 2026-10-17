@@ -3,7 +3,7 @@ use cursor_shape::{PointerCursor, SentCursor};
 use hecs::{CommandBuffer, DynamicBundle};
 use log::{debug, error, trace, warn};
 use macros::simple_event_shunt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use wayland_client::globals::Global;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1;
 use wayland_protocols::{
@@ -68,6 +68,124 @@ use wayland_server::{
 };
 
 impl<S: X11Selection> InnerServerState<S> {
+    fn make_scaled_region(&self, surface: Entity, ops: Option<Vec<RegionOp>>) -> ScaledRegion {
+        let scale = self
+            .world
+            .get::<&SurfaceScaleFactor>(surface)
+            .map(|s| s.0)
+            .unwrap_or(self.current_scale);
+        let client = ops.as_ref().map(|ops| {
+            let region = self.compositor.create_region(&self.qh, ());
+            for op in ops {
+                let (x, y, width, height, add) = match *op {
+                    RegionOp::Add {
+                        x,
+                        y,
+                        width,
+                        height,
+                    } => (x, y, width, height, true),
+                    RegionOp::Subtract {
+                        x,
+                        y,
+                        width,
+                        height,
+                    } => (x, y, width, height, false),
+                };
+                let sx = (x as f64 / scale).round() as i32;
+                let sy = (y as f64 / scale).round() as i32;
+                let w = ((((x as f64 + width as f64) / scale).round() as i64) - sx as i64)
+                    .clamp(0, i32::MAX as i64) as i32;
+                let h = ((((y as f64 + height as f64) / scale).round() as i64) - sy as i64)
+                    .clamp(0, i32::MAX as i64) as i32;
+                if add {
+                    region.add(sx, sy, w, h);
+                } else {
+                    region.subtract(sx, sy, w, h);
+                }
+            }
+            region
+        });
+        ScaledRegion {
+            surface,
+            ops,
+            client,
+        }
+    }
+
+    fn install_scaled_region(&mut self, entity: Entity, cache: ScaledRegion) {
+        if let Ok(surface) = self.world.get::<&client::wl_surface::WlSurface>(entity) {
+            surface.set_input_region(cache.client.as_ref());
+        } else if let Ok(pointer) = self.world.get::<&LockedPointerClient>(entity) {
+            pointer.set_region(cache.client.as_ref());
+        } else if let Ok(pointer) = self.world.get::<&ConfinedPointerClient>(entity) {
+            pointer.set_region(cache.client.as_ref());
+        }
+        if let Ok(old) = self.world.remove_one::<ScaledRegion>(entity) {
+            if let Some(region) = old.client {
+                region.destroy();
+            }
+        }
+        self.world.insert_one(entity, cache).unwrap();
+    }
+
+    fn update_constraint_region(&mut self, entity: Entity, region: Option<&WlRegion>) {
+        let surface = self.world.get::<&ScaledRegion>(entity).unwrap().surface;
+        let ops = region.map(|r| r.data::<RegionData>().unwrap().ops.lock().unwrap().clone());
+        self.install_scaled_region(entity, self.make_scaled_region(surface, ops));
+    }
+
+    fn destroy_scaled_region(&mut self, entity: Entity) {
+        if let Ok(cache) = self.world.remove_one::<ScaledRegion>(entity) {
+            if let Some(region) = cache.client {
+                region.destroy();
+            }
+        }
+    }
+
+    pub(super) fn refresh_scaled_inputs(&mut self) {
+        let cached = self
+            .world
+            .query::<&ScaledRegion>()
+            .iter()
+            .map(|(e, c)| (e, c.clone()))
+            .collect::<Vec<_>>();
+        let mut surfaces = std::collections::HashSet::new();
+        for (entity, cache) in cached {
+            if !self.world.contains(cache.surface) {
+                self.destroy_scaled_region(entity);
+                continue;
+            }
+            if let Ok(mut scale) = self.world.get::<&mut SurfaceScaleFactor>(entity) {
+                scale.0 = self.current_scale;
+            }
+            let new = self.make_scaled_region(cache.surface, cache.ops);
+            surfaces.insert(cache.surface);
+            self.install_scaled_region(entity, new);
+        }
+        let cursors = self
+            .world
+            .query::<&event::CursorSurface>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect::<Vec<_>>();
+        for entity in cursors {
+            // Keep an existing cursor image's raster basis until a new image
+            // arrives. Changing global DPI does not redraw client-owned pixels.
+            let size = self
+                .world
+                .get::<&CursorImageSize>(entity)
+                .ok()
+                .and_then(|s| s.0);
+            self.update_cursor_image_size(entity, size);
+            surfaces.insert(entity);
+        }
+        for entity in surfaces {
+            if let Ok(surface) = self.world.get::<&client::wl_surface::WlSurface>(entity) {
+                surface.commit();
+            }
+        }
+    }
+
     /// Record that Xwayland uses `surface` as a cursor image and return the
     /// hotspot to forward, in logical coordinates.
     ///
@@ -158,9 +276,6 @@ impl<S: X11Selection> InnerServerState<S> {
     /// re-send `set_cursor` if the hotspot forwarded earlier assumed the wrong
     /// factor.
     fn update_cursor_image(&self, surface: Entity, buffer: Option<&WlBuffer>) {
-        let Ok(mut cursor) = self.world.get::<&mut event::CursorSurface>(surface) else {
-            return;
-        };
         let size = buffer.and_then(|b| {
             let entity: Entity = b.data().copied()?;
             self.world
@@ -168,6 +283,13 @@ impl<S: X11Selection> InnerServerState<S> {
                 .ok()
                 .map(|s| *s)
         });
+        self.update_cursor_image_size(surface, size);
+    }
+
+    fn update_cursor_image_size(&self, surface: Entity, size: Option<event::BufferSize>) {
+        let Ok(mut cursor) = self.world.get::<&mut event::CursorSurface>(surface) else {
+            return;
+        };
         let sent_hotspot = cursor.logical_hotspot();
         if let Some(size) = size {
             cursor.factor =
@@ -255,7 +377,16 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                     trace!("xwayland attached null buffer to {client:?}");
                 }
                 if data.has::<event::CursorSurface>() {
+                    if state.scaling_config.enabled {
+                        data.get::<&mut event::CursorSurface>().unwrap().scale =
+                            state.current_scale;
+                    }
                     state.update_cursor_image(*entity, buffer.as_ref());
+                    let size = buffer
+                        .as_ref()
+                        .and_then(|b| b.data::<Entity>().copied())
+                        .and_then(|e| state.world.get::<&event::BufferSize>(e).ok().map(|s| *s));
+                    cmd.insert(*entity, (CursorImageSize(size),));
                 }
                 let buffer = buffer.as_ref().map(|b| {
                     let entity: Entity = b.data().copied().unwrap();
@@ -296,6 +427,13 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                 }
             }
             Request::<WlSurface>::Destroy => {
+                if let Some(cache) = data.get::<&ScaledRegion>() {
+                    if let Some(region) = &cache.client {
+                        region.destroy();
+                    }
+                    cmd.remove_one::<ScaledRegion>(*entity);
+                }
+
                 if !data.has::<x::Window>() {
                     cmd.despawn(*entity);
                 }
@@ -324,8 +462,25 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                 client.set_buffer_scale(scale);
             }
             Request::<WlSurface>::SetInputRegion { region } => {
-                let region = region.as_ref().map(|r| r.data().unwrap());
-                client.set_input_region(region);
+                if state.scaling_config.enabled {
+                    let cache = state.make_scaled_region(
+                        *entity,
+                        region
+                            .as_ref()
+                            .map(|r| r.data::<RegionData>().unwrap().ops.lock().unwrap().clone()),
+                    );
+                    client.set_input_region(cache.client.as_ref());
+                    if let Some(old) = data.get::<&ScaledRegion>().and_then(|c| c.client.clone()) {
+                        old.destroy();
+                    }
+                    cmd.insert(*entity, (cache,));
+                } else {
+                    client.set_input_region(
+                        region
+                            .as_ref()
+                            .map(|r| &r.data::<RegionData>().unwrap().client),
+                    );
+                }
             }
             other => warn!("unhandled surface request: {other:?}"),
         }
@@ -337,22 +492,75 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
     }
 }
 
-impl<S: X11Selection> Dispatch<WlRegion, client::wl_region::WlRegion> for InnerServerState<S> {
+#[derive(Clone, Copy)]
+struct CursorImageSize(Option<event::BufferSize>);
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RegionOp {
+    Add {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    Subtract {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+}
+pub(super) struct RegionData {
+    client: client::wl_region::WlRegion,
+    ops: Mutex<Vec<RegionOp>>,
+}
+#[derive(Clone)]
+pub(super) struct ScaledRegion {
+    surface: Entity,
+    ops: Option<Vec<RegionOp>>,
+    pub(super) client: Option<client::wl_region::WlRegion>,
+}
+
+impl<S: X11Selection> Dispatch<WlRegion, RegionData> for InnerServerState<S> {
     fn request(
         _: &mut Self,
         _: &wayland_server::Client,
         _: &WlRegion,
         request: <WlRegion as Resource>::Request,
-        client: &client::wl_region::WlRegion,
+        data: &RegionData,
         _: &DisplayHandle,
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
-        macros::simple_event_shunt! {
-            client, request: wl_region::Request => [
-                Add { x, y, width, height },
-                Subtract { x, y, width, height },
-                Destroy
-            ]
+        match request {
+            wl_region::Request::Add {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                data.ops.lock().unwrap().push(RegionOp::Add {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+                data.client.add(x, y, width, height);
+            }
+            wl_region::Request::Subtract {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                data.ops.lock().unwrap().push(RegionOp::Subtract {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+                data.client.subtract(x, y, width, height);
+            }
+            wl_region::Request::Destroy => data.client.destroy(),
+            _ => unreachable!(),
         }
     }
 }
@@ -397,7 +605,13 @@ impl<S: X11Selection>
             }
             Request::<WlCompositor>::CreateRegion { id } => {
                 let c_region = client.create_region(&state.qh, ());
-                data_init.init(id, c_region);
+                data_init.init(
+                    id,
+                    RegionData {
+                        client: c_region,
+                        ops: Mutex::new(Vec::new()),
+                    },
+                );
             }
             other => {
                 warn!("unhandled wlcompositor request: {other:?}");
@@ -1071,11 +1285,21 @@ impl<S: X11Selection> Dispatch<ConfinedPointerServer, Entity> for InnerServerSta
         _: &DisplayHandle,
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
+        if state.scaling_config.enabled {
+            match &request {
+                cp::Request::SetRegion { region } => {
+                    state.update_constraint_region(*entity, region.as_ref());
+                    return;
+                }
+                cp::Request::Destroy => state.destroy_scaled_region(*entity),
+                _ => {}
+            }
+        }
         let client = state.world.get::<&ConfinedPointerClient>(*entity).unwrap();
         simple_event_shunt! {
             client, request: cp::Request => [
                 SetRegion {
-                    |region| region.as_ref().map(|r| r.data().unwrap())
+                    |region| region.as_ref().map(|r| &r.data::<RegionData>().unwrap().client)
                 },
                 Destroy
             ]
@@ -1102,19 +1326,18 @@ impl<S: X11Selection> Dispatch<LockedPointerServer, Entity> for InnerServerState
                     .world
                     .query_one_mut::<(&LockedPointerClient, &SurfaceScaleFactor)>(*entity)
                     .unwrap();
-
-                // Xwayland believes that the surface is actually <surface scale factor> times bigger
-                // than it currently is, and therefore that the cursor position is also scaled up by the same
-                // amount. So we need to divide the cursor position from Xwayland by the surface scale
-                // to get where the cursor should actually be positioned.
-
                 client.set_cursor_position_hint(surface_x / scale.0, surface_y / scale.0);
             }
+            lp::Request::SetRegion { region } if state.scaling_config.enabled => {
+                state.update_constraint_region(*entity, region.as_ref())
+            }
             lp::Request::Destroy => {
-                {
-                    let client = state.world.get::<&LockedPointerClient>(*entity).unwrap();
-                    client.destroy();
-                }
+                state.destroy_scaled_region(*entity);
+                state
+                    .world
+                    .get::<&LockedPointerClient>(*entity)
+                    .unwrap()
+                    .destroy();
                 state.world.despawn(*entity).unwrap();
             }
             _ => warn!("unhandled locked pointer request: {request:?}"),
@@ -1149,6 +1372,14 @@ impl<S: X11Selection>
                 let ptr_key: Entity = pointer.data().copied().unwrap();
 
                 let entity = state.world.reserve_entity();
+                let scaled = state.scaling_config.enabled.then(|| {
+                    state.make_scaled_region(
+                        surf_key,
+                        region
+                            .as_ref()
+                            .map(|r| r.data::<RegionData>().unwrap().ops.lock().unwrap().clone()),
+                    )
+                });
                 let client = {
                     let c_surface = state
                         .world
@@ -1161,7 +1392,13 @@ impl<S: X11Selection>
                     client.confine_pointer(
                         &c_surface,
                         &c_ptr,
-                        region.as_ref().map(|r| r.data().unwrap()),
+                        if let Some(cache) = &scaled {
+                            cache.client.as_ref()
+                        } else {
+                            region
+                                .as_ref()
+                                .map(|r| &r.data::<RegionData>().unwrap().client)
+                        },
                         convert_wenum(lifetime),
                         &state.qh,
                         entity,
@@ -1170,6 +1407,9 @@ impl<S: X11Selection>
                 let server = data_init.init(id, entity);
 
                 state.world.spawn_at(entity, (client, server));
+                if let Some(cache) = scaled {
+                    state.world.insert_one(entity, cache).unwrap();
+                }
             }
             Request::LockPointer {
                 id,
@@ -1181,6 +1421,14 @@ impl<S: X11Selection>
                 let surf_key: Entity = surface.data().copied().unwrap();
                 let ptr_key: Entity = pointer.data().copied().unwrap();
                 let entity = state.world.reserve_entity();
+                let scaled = state.scaling_config.enabled.then(|| {
+                    state.make_scaled_region(
+                        surf_key,
+                        region
+                            .as_ref()
+                            .map(|r| r.data::<RegionData>().unwrap().ops.lock().unwrap().clone()),
+                    )
+                });
 
                 let client = {
                     let c_surface = state
@@ -1194,7 +1442,13 @@ impl<S: X11Selection>
                     client.lock_pointer(
                         &c_surface,
                         &c_ptr,
-                        region.as_ref().map(|r| r.data().unwrap()),
+                        if let Some(cache) = &scaled {
+                            cache.client.as_ref()
+                        } else {
+                            region
+                                .as_ref()
+                                .map(|r| &r.data::<RegionData>().unwrap().client)
+                        },
                         convert_wenum(lifetime),
                         &state.qh,
                         entity,
@@ -1211,6 +1465,9 @@ impl<S: X11Selection>
                 state
                     .world
                     .spawn_at(entity, (client, server, surface_scale));
+                if let Some(cache) = scaled {
+                    state.world.insert_one(entity, cache).unwrap();
+                }
             }
             Request::Destroy => {
                 client.destroy();

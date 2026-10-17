@@ -1,4 +1,11 @@
-use std::collections::{hash_map, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map};
+use wayland_protocols::wp::relative_pointer::zv1::server::{
+    zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1::ZwpRelativePointerV1,
+};
+use wayland_server::protocol::wl_region::WlRegion;
+#[derive(Default, Clone)]
+struct RegionState(RegionOps);
+pub type RegionOps = Vec<(bool, i32, i32, i32, i32)>;
 #[rustversion::since(1.87)]
 use std::io::PipeWriter;
 use std::io::{Read, Write};
@@ -121,6 +128,8 @@ pub struct SurfaceData {
     pub moving: bool,
     pub resizing: Option<xdg_toplevel::ResizeEdge>,
     pub minimized: bool,
+    pub input_region: Option<RegionOps>,
+    pending_input_region: Option<Option<RegionOps>>,
 }
 
 impl SurfaceData {
@@ -257,6 +266,7 @@ struct ActivationTokenData {
 pub struct LockedPointer {
     pub surface: SurfaceId,
     pub cursor_hint: Option<Vec2f>,
+    pub region: Option<RegionOps>,
 }
 struct PointerState {
     pointer: WlPointer,
@@ -288,6 +298,7 @@ struct State {
     callbacks: Vec<WlCallback>,
     seat: Option<WlSeat>,
     pointer: Option<PointerState>,
+    relative: Option<ZwpRelativePointerV1>,
     keyboard: Option<KeyboardState>,
     touch: Option<WlTouch>,
     tablet: Option<ZwpTabletV2>,
@@ -320,6 +331,7 @@ impl Default for State {
             callbacks: Vec::new(),
             seat: None,
             pointer: None,
+            relative: None,
             keyboard: None,
             touch: None,
             tablet: None,
@@ -497,7 +509,7 @@ impl Server {
         dh.create_global::<State, WpViewporter, _>(1, ());
         dh.create_global::<State, ZwpPointerConstraintsV1, _>(1, ());
         global_noop!(ZwpLinuxDmabufV1);
-        global_noop!(ZwpRelativePointerManagerV1);
+        dh.create_global::<State, ZwpRelativePointerManagerV1, _>(1, ());
         global_noop!(WpLinuxDrmSyncobjManagerV1);
 
         struct HandlerData;
@@ -935,9 +947,21 @@ impl Server {
         self.display.flush_clients().unwrap();
     }
 
+    pub fn relative_motion(&mut self, dx: f64, dy: f64, raw_x: f64, raw_y: f64) {
+        self.state
+            .relative
+            .as_ref()
+            .unwrap()
+            .relative_motion(0, 1, dx, dy, raw_x, raw_y);
+        self.display.flush_clients().unwrap();
+    }
+
     pub fn remove_output(&mut self, output: WlOutput) {
-        let output = self.state.outputs.remove(&output).unwrap();
-        self.dh.remove_global::<State>(output.global_id.unwrap());
+        // global_remove leaves resources already bound by the client alive.
+        // A queued get_xdg_output can still refer to that valid wl_output.
+        let output = self.state.outputs.get_mut(&output).unwrap();
+        self.dh
+            .remove_global::<State>(output.global_id.take().unwrap());
         self.display.flush_clients().unwrap();
     }
 
@@ -1059,6 +1083,7 @@ simple_global_dispatch!(ZxdgDecorationManagerV1);
 simple_global_dispatch!(WpViewporter);
 simple_global_dispatch!(WpFractionalScaleManagerV1);
 simple_global_dispatch!(ZwpPointerConstraintsV1);
+simple_global_dispatch!(ZwpRelativePointerManagerV1);
 
 impl Dispatch<ZwpTabletManagerV2, ()> for State {
     fn request(
@@ -2051,10 +2076,15 @@ impl Dispatch<WlCompositor, ()> for State {
                         moving: false,
                         resizing: None,
                         minimized: false,
+                        input_region: None,
+                        pending_input_region: None,
                     },
                 );
                 state.last_surface_id = Some(SurfaceId(id));
                 state.created_surfaces.push(SurfaceId(id));
+            }
+            proto::wl_compositor::Request::CreateRegion { id } => {
+                data_init.init(id, Mutex::new(RegionState::default()));
             }
             _ => unreachable!(),
         }
@@ -2131,7 +2161,11 @@ impl Dispatch<WlSurface, ()> for State {
                     height,
                 });
             }
-            Commit => {}
+            Commit => {
+                if let Some(region) = data.pending_input_region.take() {
+                    data.input_region = region;
+                }
+            }
             Destroy => {
                 let id = SurfaceId(resource.id().protocol_id());
                 if let Some(kb) = state
@@ -2144,7 +2178,16 @@ impl Dispatch<WlSurface, ()> for State {
                 }
                 state.surfaces.remove(&id);
             }
-            SetInputRegion { .. } => {}
+            SetInputRegion { region } => {
+                data.pending_input_region = Some(region.map(|r| {
+                    r.data::<Mutex<RegionState>>()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .0
+                        .clone()
+                }));
+            }
             SetBufferScale { .. } => {}
             other => todo!("unhandled request {other:?}"),
         }
@@ -2592,7 +2635,7 @@ impl Dispatch<ZwpPointerConstraintsV1, ()> for State {
                 id,
                 surface,
                 pointer,
-                region: _,
+                region,
                 lifetime: _,
             } => {
                 let pointer_state = state.pointer.as_mut().unwrap();
@@ -2604,6 +2647,14 @@ impl Dispatch<ZwpPointerConstraintsV1, ()> for State {
                 pointer_state.locked = Some(LockedPointer {
                     surface: surface_id,
                     cursor_hint: None,
+                    region: region.map(|r| {
+                        r.data::<Mutex<RegionState>>()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .0
+                            .clone()
+                    }),
                 });
             }
             _ => todo!("{request:?}"),
@@ -2633,7 +2684,84 @@ impl Dispatch<ZwpLockedPointerV1, ()> for State {
                     y: surface_y,
                 });
             }
+            zwp_locked_pointer_v1::Request::SetRegion { region } => {
+                state
+                    .pointer
+                    .as_mut()
+                    .unwrap()
+                    .locked
+                    .as_mut()
+                    .unwrap()
+                    .region = region.map(|r| {
+                    r.data::<Mutex<RegionState>>()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .0
+                        .clone()
+                });
+            }
+            zwp_locked_pointer_v1::Request::Destroy => {
+                state.pointer.as_mut().unwrap().locked = None;
+            }
             _ => todo!("{request:?}"),
         }
+    }
+}
+
+impl Dispatch<WlRegion, Mutex<RegionState>> for State {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &WlRegion,
+        request: <WlRegion as Resource>::Request,
+        data: &Mutex<RegionState>,
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            proto::wl_region::Request::Add {
+                x,
+                y,
+                width,
+                height,
+            } => data.lock().unwrap().0.push((true, x, y, width, height)),
+            proto::wl_region::Request::Subtract {
+                x,
+                y,
+                width,
+                height,
+            } => data.lock().unwrap().0.push((false, x, y, width, height)),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpRelativePointerManagerV1, ()> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ZwpRelativePointerManagerV1,
+        request: <ZwpRelativePointerManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        if let zwp_relative_pointer_manager_v1::Request::GetRelativePointer { id, .. } = request {
+            state.relative = Some(data_init.init(id, ()));
+        }
+    }
+}
+impl Dispatch<ZwpRelativePointerV1, ()> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ZwpRelativePointerV1,
+        _: <ZwpRelativePointerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        state.relative = None;
     }
 }

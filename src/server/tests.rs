@@ -114,6 +114,7 @@ struct Compositor {
     seat: TestObject<WlSeat>,
     tablet_man: TestObject<ZwpTabletManagerV2>,
     pointer_constraints: TestObject<ZwpPointerConstraintsV1>,
+    relative_pointer_man: TestObject<ZwpRelativePointerManagerV1>,
 } => CompositorOptional
 
 }
@@ -534,6 +535,9 @@ impl<C: XConnection> TestFixture<C> {
                     x if x == XwaylandShellV1::interface().name => bind!(shell),
                     x if x == WlSeat::interface().name => bind!(seat),
                     x if x == ZwpTabletManagerV2::interface().name => bind!(tablet_man),
+                    x if x == ZwpRelativePointerManagerV1::interface().name => {
+                        bind!(relative_pointer_man)
+                    }
                     x if x == ZwpPointerConstraintsV1::interface().name => {
                         bind!(pointer_constraints)
                     }
@@ -4722,3 +4726,5 @@ fn popup_coordinates_output_move_and_configure_in_one_dispatch() {
         f.run();
     }
 }
+
+mod scaling;
