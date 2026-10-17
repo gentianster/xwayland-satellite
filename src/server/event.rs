@@ -404,8 +404,10 @@ impl SurfaceEvents {
             let window = *window;
             let (x, y) = if let Some((parent_dims, parent_scale)) = parent_frame {
                 (
-                    parent_dims.x as i32 + (pending.x as f64 * parent_scale) as i32,
-                    parent_dims.y as i32 + (pending.y as f64 * parent_scale) as i32,
+                    parent_dims.x as i32
+                        + popup_offset(pending.x, parent_scale, state.scaling_config.enabled),
+                    parent_dims.y as i32
+                        + popup_offset(pending.y, parent_scale, state.scaling_config.enabled),
                 )
             } else if popup_parent.is_some() {
                 (
@@ -1341,6 +1343,17 @@ fn update_window_output_offsets(
             role.is_some_and(|role| matches!(role, SurfaceRole::Popup(_))),
             connection,
         );
+    }
+}
+
+// Common-B projection uses nearest X pixel, including signed offsets. Legacy
+// popup behavior keeps its original truncation when the optional mode is off.
+pub(super) fn popup_offset(logical: i32, scale: f64, common_scale: bool) -> i32 {
+    let pixels = logical as f64 * scale;
+    if common_scale {
+        pixels.round() as i32
+    } else {
+        pixels as i32
     }
 }
 

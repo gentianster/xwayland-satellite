@@ -999,8 +999,10 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 let Some((parent_dims, parent_scale)) = self.window_frame(*parent) else {
                     return false;
                 };
-                let x = parent_dims.x as i32 + (position.0 as f64 * parent_scale) as i32;
-                let y = parent_dims.y as i32 + (position.1 as f64 * parent_scale) as i32;
+                let x = parent_dims.x as i32
+                    + event::popup_offset(position.0, parent_scale, self.scaling_config.enabled);
+                let y = parent_dims.y as i32
+                    + event::popup_offset(position.1, parent_scale, self.scaling_config.enabled);
                 let mut data = self.world.get::<&mut WindowData>(*entity).unwrap();
                 if (data.attrs.dims.x as i32, data.attrs.dims.y as i32) != (x, y) {
                     data.attrs.dims.x = x as i16;
