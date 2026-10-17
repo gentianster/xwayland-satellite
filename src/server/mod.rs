@@ -1542,6 +1542,33 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             let window_data = data.get::<&WindowData>().unwrap();
             if window_data.attrs.role.is_popup() {
                 popup_for = self.popup_parent(window, window_data.attrs.transient_for);
+                if std::env::var_os("SHOJI_POPUP_PARENT_TRACE").is_some() {
+                    let explicit_status = window_data
+                        .attrs
+                        .transient_for
+                        .and_then(|parent| self.windows.get(&parent))
+                        .and_then(|entity| {
+                            let parent_data = self.world.get::<&WindowData>(*entity).ok()?;
+                            let parent_role = self.world.get::<&SurfaceRole>(*entity).ok()?;
+                            Some((
+                                parent_data.mapped,
+                                parent_role
+                                    .xdg()
+                                    .map(|xdg| (xdg.configured, xdg.surface.is_alive())),
+                            ))
+                        });
+                    log::info!(
+                        "popup-parent-explicit-status window={window:?} status={explicit_status:?}"
+                    );
+                    log::info!(
+                        "popup-parent-trace window={window:?} explicit={:?} group={:?} hovered={:?} focused={:?} selected={popup_for:?} dims={:?}",
+                        window_data.attrs.transient_for,
+                        window_data.attrs.group,
+                        self.last_hovered,
+                        self.last_focused_toplevel,
+                        window_data.attrs.dims
+                    );
+                }
             }
             splash = window_data.attrs.role == WindowRole::Splash;
 

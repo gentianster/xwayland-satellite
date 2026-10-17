@@ -1170,6 +1170,16 @@ impl XState {
         if self.handle_selection_property_change(&event) {
             return;
         }
+        if std::env::var_os("SHOJI_POPUP_PARENT_TRACE").is_some()
+            && event.atom() == self.atoms.wm_transient_for
+        {
+            log::info!(
+                "popup-parent-property-trace window={:?} state={:?} transient={:?}",
+                event.window(),
+                event.state(),
+                self.get_transient_for(event.window())
+            );
+        }
         if event.state() == x::Property::Delete {
             debug!(
                 "ignoring delete for property {:?}",
