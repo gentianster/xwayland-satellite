@@ -1170,7 +1170,8 @@ impl XState {
         if self.handle_selection_property_change(&event) {
             return;
         }
-        if std::env::var_os("SHOJI_POPUP_PARENT_TRACE").is_some()
+        if (option_env!("SHOJI_POPUP_PARENT_TRACE").is_some()
+            || std::env::var_os("SHOJI_POPUP_PARENT_TRACE").is_some())
             && event.atom() == self.atoms.wm_transient_for
         {
             log::info!(

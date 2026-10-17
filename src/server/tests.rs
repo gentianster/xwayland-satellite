@@ -4027,10 +4027,13 @@ fn popup_group_fallback_is_unambiguous_and_keeps_explicit_priority() {
         .unwrap()
         .attrs
         .group = Some(group);
-    assert_eq!(f.satellite.popup_parent(popup, None), Some(other));
+    assert_eq!(f.satellite.popup_parent(popup, None), None);
     assert_eq!(f.satellite.popup_parent(popup, Some(a)), Some(a));
     f.satellite.unmap_window(b);
     f.run();
     assert_eq!(f.satellite.popup_parent(popup, None), Some(a));
     assert_eq!(f.satellite.popup_parent(popup, Some(other)), Some(other));
+    f.satellite.unmap_window(a);
+    f.run();
+    assert_eq!(f.satellite.popup_parent(popup, None), None);
 }

@@ -1511,11 +1511,13 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 (data.attrs.group == Some(group) && matches!(role, SurfaceRole::Toplevel(Some(_))))
                     .then_some(*parent)
             });
-            if let Some(parent) = members.next() {
-                if members.next().is_none() {
-                    return Some(parent);
-                }
-            }
+            // A known group must not fall back to a different application.
+            // If several or no group toplevels are usable, leave this utility
+            // independent instead of guessing which main window owns it.
+            return match (members.next(), members.next()) {
+                (Some(parent), None) => Some(parent),
+                _ => None,
+            };
         }
         [self.last_hovered, self.last_focused_toplevel]
             .into_iter()
@@ -1542,7 +1544,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             let window_data = data.get::<&WindowData>().unwrap();
             if window_data.attrs.role.is_popup() {
                 popup_for = self.popup_parent(window, window_data.attrs.transient_for);
-                if std::env::var_os("SHOJI_POPUP_PARENT_TRACE").is_some() {
+                if option_env!("SHOJI_POPUP_PARENT_TRACE").is_some()
+                    || std::env::var_os("SHOJI_POPUP_PARENT_TRACE").is_some()
+                {
                     let explicit_status = window_data
                         .attrs
                         .transient_for
