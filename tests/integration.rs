@@ -359,7 +359,15 @@ impl Fixture {
             .unwrap()
             .logical_size(1000, 1000);
         output.done();
-        self.wait_and_dispatch();
+        // An output-only DPI update can finish through X11 properties without
+        // producing another Wayland request while no surfaces are mapped.
+        self.testwl.dispatch();
+        let mut fds = [self.pollfd.clone()];
+        let timeout = timespec_from_millis(50);
+        while poll(&mut fds, Some(&timeout)).unwrap() > 0 {
+            self.testwl.dispatch();
+            self.pollfd.clear_revents();
+        }
     }
 }
 
