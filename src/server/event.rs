@@ -619,8 +619,8 @@ impl Event for client::wl_seat::Event {
     }
 }
 
-struct PendingEnter(client::wl_pointer::Event);
-enum CurrentSurface {
+pub(super) struct PendingEnter(pub(super) client::wl_pointer::Event);
+pub(super) enum CurrentSurface {
     Xwayland(Entity),
     Decoration(Entity),
 }
@@ -631,6 +631,93 @@ impl CurrentSurface {
     }
 }
 pub struct LastClickSerial(pub client::wl_seat::WlSeat, pub u32);
+
+#[derive(Clone)]
+struct LastPointerPosition {
+    surface: Entity,
+    native: Option<WlSurface>,
+    time: u32,
+    x: f64,
+    y: f64,
+    // None means the event preceded a pending X configure.
+    forwarded_frame: Option<(i16, i16, f64)>,
+}
+
+impl LastPointerPosition {
+    fn new(world: &World, pointer: Entity, surface: Entity, time: u32, x: f64, y: f64) -> Self {
+        let native = world
+            .get::<&WlSurface>(surface)
+            .ok()
+            .map(|surface| (*surface).clone());
+        let forwarded_frame = if world.get::<&PendingSurfaceState>(surface).is_ok() {
+            // Retain the known X frame until the pending configure completes.
+            // A size-only configure then needs no redundant motion.
+            world
+                .get::<&LastPointerPosition>(pointer)
+                .ok()
+                .and_then(|previous| {
+                    (previous.surface == surface && previous.native == native)
+                        .then_some(previous.forwarded_frame)
+                        .flatten()
+                })
+        } else {
+            match (
+                world.get::<&WindowData>(surface),
+                world.get::<&SurfaceScaleFactor>(surface),
+            ) {
+                (Ok(data), Ok(scale)) => Some((data.attrs.dims.x, data.attrs.dims.y, scale.0)),
+                _ => None,
+            }
+        };
+        Self {
+            surface,
+            native,
+            time,
+            x,
+            y,
+            forwarded_frame,
+        }
+    }
+}
+
+// Moving a virtual X popup does not move the native pointer. Refresh its last
+// local position only after the checked X configure, without a new enter/grab.
+pub(super) fn refresh_configured_pointers(world: &mut World, configured: &HashSet<Entity>) {
+    let updates = world
+        .query::<(&WlPointer, &CurrentSurface, &LastPointerPosition)>()
+        .iter()
+        .filter_map(|(pointer_entity, (pointer, current, position))| {
+            let CurrentSurface::Xwayland(surface) = current else {
+                return None;
+            };
+            if position.surface != *surface || !configured.contains(surface) {
+                return None;
+            }
+            let data = world.get::<&WindowData>(*surface).ok()?;
+            let scale = world.get::<&SurfaceScaleFactor>(*surface).ok()?;
+            let native = world.get::<&WlSurface>(*surface).ok()?;
+            if !native.is_alive() || position.native.as_ref() != Some(&*native) {
+                return None;
+            }
+            let frame = (data.attrs.dims.x, data.attrs.dims.y, scale.0);
+            if position.forwarded_frame == Some(frame) {
+                return None;
+            }
+            Some((pointer_entity, pointer.clone(), position.clone(), frame))
+        })
+        .collect::<Vec<_>>();
+    for (entity, pointer, position, frame) in updates {
+        world.get::<&mut SurfaceScaleFactor>(entity).unwrap().0 = frame.2;
+        pointer.motion(position.time, position.x * frame.2, position.y * frame.2);
+        if pointer.version() >= 5 {
+            pointer.frame();
+        }
+        world
+            .get::<&mut LastPointerPosition>(entity)
+            .unwrap()
+            .forwarded_frame = Some(frame);
+    }
+}
 
 impl Event for client::wl_pointer::Event {
     fn handle<C: XConnection>(self, target: Entity, state: &mut ServerState<C>) {
@@ -705,6 +792,7 @@ impl Event for client::wl_pointer::Event {
                 else {
                     if let Some(&DecorationMarker { parent }) = surface.data() {
                         drop(query);
+                        let _ = state.world.remove_one::<LastPointerPosition>(target);
                         state
                             .world
                             .insert_one(target, CurrentSurface::Decoration(parent))
@@ -727,7 +815,19 @@ impl Event for client::wl_pointer::Event {
                     if !surface_is_popup {
                         state.last_hovered = Some(*window);
                     }
-                    cmd.insert_one(target, CurrentSurface::Xwayland(surface_entity.unwrap()));
+                    let entity = surface_entity.unwrap();
+                    cmd.insert_one(target, CurrentSurface::Xwayland(entity));
+                    cmd.insert_one(
+                        target,
+                        LastPointerPosition::new(
+                            &state.world,
+                            target,
+                            entity,
+                            0,
+                            surface_x,
+                            surface_y,
+                        ),
+                    );
                 };
 
                 if !surface_is_popup {
@@ -758,6 +858,7 @@ impl Event for client::wl_pointer::Event {
                 cmd.run_on(&mut state.world);
             }
             Self::Leave { serial, surface } => {
+                let _ = state.world.remove_one::<LastPointerPosition>(target);
                 let _ = state.world.remove_one::<PendingEnter>(target);
                 if !surface.is_alive() {
                     return;
@@ -792,7 +893,7 @@ impl Event for client::wl_pointer::Event {
                 if !handle_pending_enter(target, state, "motion") {
                     return;
                 }
-                {
+                let surface_entity = {
                     let Ok(surface) = state.world.get::<&CurrentSurface>(target) else {
                         warn!("could not motion on surface: stale surface");
                         return;
@@ -801,7 +902,33 @@ impl Event for client::wl_pointer::Event {
                         decoration::handle_pointer_motion(state, *parent, surface_x, surface_y);
                         return;
                     }
+                    let CurrentSurface::Xwayland(entity) = *surface else {
+                        unreachable!()
+                    };
+                    entity
+                };
+                let position = LastPointerPosition::new(
+                    &state.world,
+                    target,
+                    surface_entity,
+                    time,
+                    surface_x,
+                    surface_y,
+                );
+                // A DPI change need not be accompanied by another enter.
+                if let Some(scale) = state
+                    .world
+                    .get::<&SurfaceScaleFactor>(surface_entity)
+                    .ok()
+                    .filter(|_| state.scaling_config.enabled)
+                {
+                    state
+                        .world
+                        .get::<&mut SurfaceScaleFactor>(target)
+                        .unwrap()
+                        .0 = scale.0;
                 }
+                state.world.insert_one(target, position).unwrap();
                 let (server, scale) = state
                     .world
                     .query_one_mut::<(&WlPointer, &SurfaceScaleFactor)>(target)
@@ -822,6 +949,9 @@ impl Event for client::wl_pointer::Event {
             } => {
                 if !handle_pending_enter(target, state, "click") {
                     return;
+                }
+                if let Ok(mut position) = state.world.get::<&mut LastPointerPosition>(target) {
+                    position.time = time;
                 }
                 let mut cmd = CommandBuffer::new();
 
@@ -865,6 +995,11 @@ impl Event for client::wl_pointer::Event {
                 cmd.run_on(&mut state.world);
             }
             _ => {
+                if let Self::Axis { time, .. } | Self::AxisStop { time, .. } = &self {
+                    if let Ok(mut position) = state.world.get::<&mut LastPointerPosition>(target) {
+                        position.time = *time;
+                    }
+                }
                 let (server, current_surface) = state
                     .world
                     .query_one_mut::<(&WlPointer, Option<&CurrentSurface>)>(target)
@@ -1130,8 +1265,10 @@ pub(super) fn update_surface_output_membership<C: XConnection>(
                     y: ((dimensions.y - state.global_output_offset.y.value) as f64 * base).round()
                         as i32,
                 },
-                data.get::<&SurfaceRole>()
-                    .is_some_and(|role| matches!(*role, SurfaceRole::Popup(_))),
+                data.has::<super::position::Tracking>()
+                    || data
+                        .get::<&SurfaceRole>()
+                        .is_some_and(|role| matches!(*role, SurfaceRole::Popup(_))),
                 connection,
             );
         } else {
@@ -1351,11 +1488,17 @@ fn update_window_output_offsets(
     let Ok(dimensions) = world.get::<&OutputDimensions>(output) else {
         return;
     };
-    let mut query = world.query::<(&x::Window, &mut WindowData, &OnOutput, Option<&SurfaceRole>)>();
+    let mut query = world.query::<(
+        &x::Window,
+        &mut WindowData,
+        &OnOutput,
+        Option<&SurfaceRole>,
+        Option<&super::position::Tracking>,
+    )>();
 
-    for (_, (window, data, _, role)) in query
+    for (_, (window, data, _, role, position)) in query
         .into_iter()
-        .filter(|(_, (_, _, on_output, _))| on_output.0 == output)
+        .filter(|(_, (_, _, on_output, _, _))| on_output.0 == output)
     {
         data.update_output_offset(
             *window,
@@ -1365,7 +1508,7 @@ fn update_window_output_offsets(
                 y: ((dimensions.y - global_output_offset.y.value) as f64 * base_scale).round()
                     as i32,
             },
-            role.is_some_and(|role| matches!(role, SurfaceRole::Popup(_))),
+            position.is_some() || role.is_some_and(|role| matches!(role, SurfaceRole::Popup(_))),
             connection,
         );
     }

@@ -153,6 +153,14 @@ impl std::ops::DerefMut for MyWorld {
 }
 
 impl MyWorld {
+    pub(super) fn push_position_event(
+        &mut self,
+        target: Entity,
+        event: super::position::PositionEvent,
+    ) {
+        self.events.push((target, ObjectEvent::HostPosition(event)));
+    }
+
     pub(crate) fn read_events(&mut self) -> Vec<(Entity, ObjectEvent)> {
         let mut events = std::mem::take(&mut self.events);
         self.queued_events.retain(|rx| {

@@ -1,3 +1,8 @@
+mod position_protocol;
+use position_protocol::{
+    shoji_xwayland_position_manager_v1::{self, ShojiXwaylandPositionManagerV1},
+    shoji_xwayland_position_v1::{self, ShojiXwaylandPositionV1},
+};
 use std::collections::{HashMap, HashSet, hash_map};
 use wayland_protocols::wp::relative_pointer::zv1::server::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1::ZwpRelativePointerV1,
@@ -313,6 +318,8 @@ struct State {
     xdg_activation: Option<XdgActivationV1>,
     valid_tokens: HashSet<String>,
     token_counter: u32,
+    position_manager: Option<ShojiXwaylandPositionManagerV1>,
+    tracked_positions: HashMap<WlSurface, ShojiXwaylandPositionV1>,
 }
 
 impl Default for State {
@@ -346,6 +353,8 @@ impl Default for State {
             xdg_activation: None,
             valid_tokens: HashSet::new(),
             token_counter: 0,
+            position_manager: None,
+            tracked_positions: HashMap::new(),
         }
     }
 }
@@ -591,6 +600,46 @@ impl Server {
             callback.done(self.state.begin.elapsed().as_millis().try_into().unwrap());
         }
         self.display.flush_clients().unwrap();
+    }
+
+    /// Advertise ordered positions only in fixtures that explicitly opt in.
+    pub fn enable_position_protocol(&mut self) {
+        self.dh
+            .create_global::<State, ShojiXwaylandPositionManagerV1, _>(1, ());
+    }
+
+    pub fn position_is_tracked(&self, surface: SurfaceId) -> bool {
+        self.state
+            .surfaces
+            .get(&surface)
+            .is_some_and(|data| self.state.tracked_positions.contains_key(&data.surface))
+    }
+
+    /// Queue without flushing, so output/state/done/input can share one batch.
+    pub fn send_surface_position(
+        &self,
+        surface: SurfaceId,
+        epoch: u32,
+        x: f64,
+        y: f64,
+        geometry_x: i32,
+        geometry_y: i32,
+    ) {
+        let native = &self.state.surfaces[&surface].surface;
+        self.state.tracked_positions[native].state(epoch, x, y, geometry_x, geometry_y);
+    }
+
+    pub fn invalidate_surface_position(&self, surface: SurfaceId, epoch: u32) {
+        let native = &self.state.surfaces[&surface].surface;
+        self.state.tracked_positions[native].invalidate(epoch);
+    }
+
+    pub fn position_done(&self, epoch: u32) {
+        self.state
+            .position_manager
+            .as_ref()
+            .expect("position manager was not bound")
+            .done(epoch);
     }
 
     pub fn get_surface_data(&self, surface_id: SurfaceId) -> Option<&SurfaceData> {
@@ -2763,5 +2812,62 @@ impl Dispatch<ZwpRelativePointerV1, ()> for State {
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
         state.relative = None;
+    }
+}
+
+impl GlobalDispatch<ShojiXwaylandPositionManagerV1, ()> for State {
+    fn bind(
+        state: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: wayland_server::New<ShojiXwaylandPositionManagerV1>,
+        _: &(),
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        state.position_manager = Some(data_init.init(resource, ()));
+    }
+}
+
+impl Dispatch<ShojiXwaylandPositionManagerV1, ()> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &ShojiXwaylandPositionManagerV1,
+        request: shoji_xwayland_position_manager_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            shoji_xwayland_position_manager_v1::Request::GetSurface { id, surface } => {
+                let tracked = data_init.init(id, surface.clone());
+                state.tracked_positions.insert(surface, tracked);
+            }
+            shoji_xwayland_position_manager_v1::Request::Destroy => {
+                if state.position_manager.as_ref() == Some(resource) {
+                    state.position_manager = None;
+                }
+            }
+        }
+    }
+}
+
+impl Dispatch<ShojiXwaylandPositionV1, WlSurface> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &ShojiXwaylandPositionV1,
+        request: shoji_xwayland_position_v1::Request,
+        surface: &WlSurface,
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            shoji_xwayland_position_v1::Request::Destroy => {
+                if state.tracked_positions.get(surface) == Some(resource) {
+                    state.tracked_positions.remove(surface);
+                }
+            }
+        }
     }
 }

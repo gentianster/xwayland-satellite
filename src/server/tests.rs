@@ -227,6 +227,7 @@ struct FakeXConnection {
     send_take_focus_window: Option<Window>,
     windows: HashMap<Window, WindowData>,
     set_window_dims_counter: usize,
+    reject_window_dims: bool,
 }
 
 impl FakeXConnection {
@@ -285,6 +286,9 @@ impl super::XConnection for FakeXConnection {
 
     #[track_caller]
     fn set_window_dims(&mut self, window: Window, state: super::PendingSurfaceState) -> bool {
+        if self.reject_window_dims {
+            return false;
+        }
         self.window_mut(window).dims = WindowDims {
             x: state.x as _,
             y: state.y as _,
@@ -297,6 +301,10 @@ impl super::XConnection for FakeXConnection {
 
     #[track_caller]
     fn focus_window(&mut self, window: Window, _output_name: Option<String>) {
+        if window == x::WINDOW_NONE {
+            self.focused_window = None;
+            return;
+        }
         assert!(
             self.windows.contains_key(&window),
             "Unknown window: {window:?}"
@@ -4728,3 +4736,5 @@ fn popup_coordinates_output_move_and_configure_in_one_dispatch() {
 }
 
 mod scaling;
+
+mod position;

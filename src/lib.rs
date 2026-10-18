@@ -1,4 +1,5 @@
 mod server;
+pub mod position_protocol;
 pub mod xstate;
 
 use crate::server::{NoConnection, PendingSurfaceState, ServerState};

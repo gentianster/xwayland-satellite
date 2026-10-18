@@ -429,6 +429,10 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
             Request::<WlSurface>::Destroy => {
                 // The X window can outlive this surface. Its next surface
                 // must not inherit visibility or an output choice from this one.
+                if let Some(track) = data.get::<&super::position::Tracking>() {
+                    track.object.destroy();
+                    cmd.remove_one::<super::position::Tracking>(*entity);
+                }
                 if data.has::<event::EnteredOutputs>() {
                     cmd.remove_one::<event::EnteredOutputs>(*entity);
                 }
@@ -938,7 +942,14 @@ impl<S: X11Selection>
                     client.get_relative_pointer(&client_pointer, &state.qh, entity)
                 };
                 let server = data_init.init(id, entity);
-                state.world.spawn_at(entity, (server, client));
+                state.world.spawn_at(
+                    entity,
+                    (
+                        server,
+                        client,
+                        super::position::RelatedPointer(pointer_entity),
+                    ),
+                );
             }
             _ => warn!("unhandled relative pointer request: {request:?}"),
         }

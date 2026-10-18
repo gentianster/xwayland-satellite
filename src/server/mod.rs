@@ -3,6 +3,7 @@ pub(crate) mod cursor_shape;
 mod decoration;
 mod dispatch;
 mod event;
+mod position;
 pub(crate) mod selection;
 #[cfg(test)]
 mod tests;
@@ -350,6 +351,7 @@ macro_rules! impl_event {
 impl_event! {
 enum ObjectEvent {
     Surface(event::SurfaceEvents),
+    HostPosition(position::PositionEvent),
     Buffer(client::wl_buffer::Event),
     Seat(client::wl_seat::Event),
     Pointer(client::wl_pointer::Event),
@@ -516,6 +518,8 @@ pub struct InnerServerState<S: X11Selection> {
     /// Cursor-shape equivalent of the X cursor currently displayed, from its
     /// XFixes name. `None` when it has no name or no equivalent.
     x_cursor_shape: Option<Shape>,
+    host_position_manager: Option<crate::position_protocol::client::shoji_xwayland_position_manager_v1::ShojiXwaylandPositionManagerV1>,
+    deferred_position_inputs: Vec<(Entity, ObjectEvent, Option<client::wl_surface::WlSurface>)>,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -611,7 +615,13 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             .contents()
             .with_list(|globals| handle_new_globals::<S>(&mut globals_map, &dh, globals));
 
-        let world = MyWorld::new(global_list);
+        let mut world = MyWorld::new(global_list);
+        let host_position_manager = if scaling_config.enabled {
+            let key = world.spawn(());
+            world.global_list.bind::<crate::position_protocol::client::shoji_xwayland_position_manager_v1::ShojiXwaylandPositionManagerV1,_,_>(&qh,1..=1,key).ok()
+        } else {
+            None
+        };
         let client = dh.insert_client(client, std::sync::Arc::new(())).unwrap();
 
         let inner = InnerServerState {
@@ -653,6 +663,8 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             scaled_outputs_dirty: false,
             cursor_shape_manager,
             x_cursor_shape: None,
+            host_position_manager,
+            deferred_position_inputs: Vec::new(),
             decoration_manager,
             world,
         };
@@ -694,17 +706,112 @@ impl<C: XConnection> ServerState<C> {
     }
 
     pub fn handle_clientside_events(&mut self) {
-        let previous_base = self.current_scale;
         self.inner.handle_globals(&mut self.connection);
-
         for (target, event) in self.world.read_events() {
             if !self.world.contains(target) {
-                warn!("could not handle clientside event: stale object");
                 continue;
             }
+            let is_input = matches!(
+                &event,
+                ObjectEvent::Pointer(_)
+                    | ObjectEvent::Keyboard(_)
+                    | ObjectEvent::RelativePointer(_)
+                    | ObjectEvent::Touch(_)
+                    | ObjectEvent::TabletTool(_)
+                    | ObjectEvent::TabletPad(_)
+                    | ObjectEvent::TabletPadGroup(_)
+                    | ObjectEvent::TabletPadRing(_)
+                    | ObjectEvent::TabletPadStrip(_)
+            );
+            let is_done = matches!(
+                &event,
+                ObjectEvent::HostPosition(position::PositionEvent::Done(_))
+            );
+            if is_input && self.host_position_manager.is_some() {
+                self.note_native_input_focus(target, &event);
+                let native = self.input_native_surface(target, &event);
+                let leave = matches!(
+                    &event,
+                    ObjectEvent::Pointer(client::wl_pointer::Event::Leave { .. })
+                        | ObjectEvent::Keyboard(client::wl_keyboard::Event::Leave { .. })
+                );
+                if leave {
+                    self.deferred_position_inputs.retain(|(owner, queued, _)| {
+                        *owner != target
+                            || !InnerServerState::<C::X11Selection>::same_input_focus(
+                                queued, &event,
+                            )
+                    });
+                    self.note_input_focus(target, &event);
+                    event.handle(target, self);
+                    continue;
+                }
+                if !self.native_layout_ready() || !self.flush_client_geometry() {
+                    if self.deferred_position_inputs.len() < 256 {
+                        self.deferred_position_inputs.push((target, event, native));
+                    } else {
+                        warn!("Position barrier input queue full; rejecting stale input");
+                    }
+                    continue;
+                }
+                self.forward_position_inputs();
+                if native
+                    .as_ref()
+                    .is_some_and(|n| !self.input_origin_available(n))
+                {
+                    continue;
+                }
+                if InnerServerState::<C::X11Selection>::input_needs_focus(&event)
+                    && (native.is_none() || self.forwarded_input_surface(target, &event) != native)
+                {
+                    continue;
+                }
+                self.note_input_focus(target, &event);
+            }
+            event.handle(target, self);
+            if is_done && self.native_layout_ready() && self.flush_client_geometry() {
+                self.forward_position_inputs();
+            }
+        }
+        let ready = self.flush_client_geometry();
+        if ready && self.native_layout_ready() {
+            self.forward_position_inputs();
+        }
+        self.finish_clientside_events();
+    }
+
+    fn forward_position_inputs(&mut self) {
+        if !self.native_layout_ready() || !self.flush_client_geometry() {
+            return;
+        }
+        for (target, event, native) in std::mem::take(&mut self.deferred_position_inputs) {
+            if !self.world.contains(target)
+                || native
+                    .as_ref()
+                    .is_some_and(|n| !self.input_origin_available(n))
+            {
+                continue;
+            }
+            let entering = matches!(
+                &event,
+                ObjectEvent::Pointer(client::wl_pointer::Event::Enter { .. })
+                    | ObjectEvent::Keyboard(client::wl_keyboard::Event::Enter { .. })
+                    | ObjectEvent::Touch(client::wl_touch::Event::Down { .. })
+            );
+            if !entering
+                && native.as_ref().is_some_and(|expected| {
+                    self.forwarded_input_surface(target, &event).as_ref() != Some(expected)
+                })
+            {
+                continue;
+            }
+            self.note_input_focus(target, &event);
             event.handle(target, self);
         }
+    }
 
+    fn flush_client_geometry(&mut self) -> bool {
+        let previous_base = self.current_scale;
         if self.global_output_offset.x.owner.is_none()
             || self.global_output_offset.y.owner.is_none()
         {
@@ -822,6 +929,11 @@ impl<C: XConnection> ServerState<C> {
                 self.scaled_outputs_dirty = false;
             }
         }
+        if self.host_position_manager.is_some() && !event::scaled_output_batches_ready(&self.world)
+        {
+            return false;
+        }
+        self.sync_native_positions();
         self.sync_popup_coordinates();
         let pending = self
             .world
@@ -843,13 +955,28 @@ impl<C: XConnection> ServerState<C> {
                 )
             })
             .collect::<Vec<_>>();
+        let mut configured = HashSet::new();
+        let mut ready =
+            !self.scaling_config.enabled || event::scaled_output_batches_ready(&self.world);
         for (entity, window, dims) in pending {
-            self.connection.set_window_dims(window, dims);
-            self.world
-                .remove_one::<PendingSurfaceState>(entity)
-                .unwrap();
+            if self.connection.set_window_dims(window, dims) {
+                configured.insert(entity);
+                self.world
+                    .remove_one::<PendingSurfaceState>(entity)
+                    .unwrap();
+            } else if self.host_position_manager.is_some() {
+                ready = false;
+            } else {
+                let _ = self.world.remove_one::<PendingSurfaceState>(entity);
+            }
         }
+        if self.host_position_manager.is_some() {
+            event::refresh_configured_pointers(&mut self.world, &configured);
+        }
+        ready
+    }
 
+    fn finish_clientside_events(&mut self) {
         {
             if let Some(FocusData {
                 window,
@@ -969,7 +1096,15 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         let entity = *self.windows.get(&window)?;
         let data = self.world.get::<&WindowData>(entity).ok()?;
         let scale = self.world.get::<&SurfaceScaleFactor>(entity).ok()?;
-        Some((data.attrs.dims, scale.0))
+        let mut dims = data.attrs.dims;
+        let geometry = self.native_geometry_offset(window);
+        dims.x = (i32::from(dims.x)
+            + event::popup_offset(geometry.0, scale.0, self.scaling_config.enabled))
+            as i16;
+        dims.y = (i32::from(dims.y)
+            + event::popup_offset(geometry.1, scale.0, self.scaling_config.enabled))
+            as i16;
+        Some((dims, scale.0))
     }
 
     fn sync_popup_coordinates(&mut self) {
@@ -1927,6 +2062,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         drop(window);
         drop(group);
         drop(surface);
+        self.track_native_position(entity);
         if let Some(mut b) = buf.flatten() {
             b.run_on(&mut self.world);
         }
@@ -1976,8 +2112,11 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             1.max((window.attrs.dims.width as f64 / initial_scale) as i32),
             1.max((window.attrs.dims.height as f64 / initial_scale) as i32),
         );
-        let x = ((window.attrs.dims.x as i32 - parent_dims.x as i32) as f64 / initial_scale) as i32;
-        let y = ((window.attrs.dims.y as i32 - parent_dims.y as i32) as f64 / initial_scale) as i32;
+        let geometry = self.native_geometry_offset(parent);
+        let x = ((window.attrs.dims.x as i32 - parent_dims.x as i32) as f64 / initial_scale) as i32
+            - geometry.0;
+        let y = ((window.attrs.dims.y as i32 - parent_dims.y as i32) as f64 / initial_scale) as i32
+            - geometry.1;
         positioner.set_offset(x, y);
         positioner.set_anchor(Anchor::TopLeft);
         positioner.set_gravity(Gravity::BottomRight);
