@@ -23,11 +23,16 @@ fn settle(f: &mut TestFixture<FakeXConnection>) {
 }
 type Outputs = Vec<(TestObject<WlOutput>, s_proto::wl_output::WlOutput)>;
 fn three_outputs(base: Option<f64>) -> (TestFixture<FakeXConnection>, Compositor, Outputs) {
-    let mut f = TestFixture::new_pre_connect(|wl| wl.enable_fractional_scale());
-    f.satellite.scaling_config = ScalingConfig {
+    three_outputs_with_scaling(ScalingConfig {
         enabled: true,
         base_scale: base,
-    };
+    })
+}
+fn three_outputs_with_scaling(
+    config: ScalingConfig,
+) -> (TestFixture<FakeXConnection>, Compositor, Outputs) {
+    let mut f = TestFixture::new_pre_connect(|wl| wl.enable_fractional_scale());
+    f.satellite.scaling_config = config;
     let comp = f.compositor();
     let manager = f.enable_xdg_output();
     let mut outputs = Vec::new();
@@ -676,4 +681,276 @@ fn locked_region_set_region_snapshot_regenerates_and_destroy_cleans_up() {
             .count(),
         0
     );
+}
+
+#[test]
+fn fullscreen_after_leaving_last_entered_output_uses_remaining_output() {
+    let (mut f, comp, outputs) = three_outputs(Some(1.5));
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    let surface = f.testwl.get_surface_data(id).unwrap().surface.clone();
+    surface.enter(&outputs[0].1);
+    surface.enter(&outputs[1].1);
+    surface.leave(&outputs[1].1);
+    f.testwl
+        .configure_toplevel(id, 3440, 1440, vec![xdg_toplevel::State::Fullscreen]);
+    settle(&mut f);
+
+    assert_eq!(
+        f.connection().window(window).dims,
+        WindowDims {
+            x: 0,
+            y: 1080,
+            width: 5160,
+            height: 2160,
+        }
+    );
+}
+
+#[test]
+fn output_membership_new_surface_for_same_x_window_uses_its_first_output() {
+    for base in [1.0, 1.5] {
+        let (mut f, comp, outputs) = three_outputs(Some(base));
+        let window = Window::new(1);
+        let (old_surface, old_id) = f.create_toplevel(&comp, window);
+        let compositor_surface = f.testwl.get_surface_data(old_id).unwrap().surface.clone();
+        compositor_surface.enter(&outputs[1].1);
+        compositor_surface.enter(&outputs[0].1);
+        settle(&mut f);
+        assert_eq!(f.connection().window(window).dims.x, (3440.0 * base) as i16);
+
+        f.satellite.unmap_window(window);
+        old_surface.obj.destroy();
+        settle(&mut f);
+        assert!(f.testwl.get_surface_data(old_id).is_none());
+
+        let (buffer, new_surface) = comp.create_surface();
+        f.map_window(&comp, window, &new_surface.obj, &buffer);
+        settle(&mut f);
+        let new_id = f.check_new_surface();
+        assert_ne!(old_id, new_id);
+        f.testwl.move_surface_to_output(new_id, &outputs[0].1);
+        f.testwl
+            .configure_toplevel(new_id, 3440, 1440, vec![xdg_toplevel::State::Fullscreen]);
+        settle(&mut f);
+        assert_eq!(
+            f.connection().window(window).dims,
+            WindowDims {
+                x: 0,
+                y: (720.0 * base) as i16,
+                width: (3440.0 * base) as u16,
+                height: (1440.0 * base) as u16,
+            },
+            "a replacement surface must use its own first output, base={base}",
+        );
+    }
+}
+
+#[test]
+fn output_membership_destroyed_surface_survives_legacy_output_removal() {
+    let mut f = TestFixture::new();
+    let comp = f.compositor();
+    let manager = f.enable_xdg_output();
+    let (first_client, first_output) = f.new_output(0, 720);
+    f.create_xdg_output(&manager, first_client.obj);
+    let (second_client, second_output) = f.new_output(3440, 720);
+    f.create_xdg_output(&manager, second_client.obj);
+    settle(&mut f);
+    assert!(f.satellite.fractional_scale.is_none());
+    assert!(!f.satellite.scaling_config.enabled);
+
+    let window = Window::new(1);
+    let (surface, id) = f.create_toplevel(&comp, window);
+    let compositor_surface = f.testwl.get_surface_data(id).unwrap().surface.clone();
+    compositor_surface.enter(&second_output);
+    compositor_surface.enter(&first_output);
+    settle(&mut f);
+    let dimensions = f.connection().window(window).dims;
+
+    f.satellite.unmap_window(window);
+    surface.obj.destroy();
+    settle(&mut f);
+    assert!(f.testwl.get_surface_data(id).is_none());
+    f.remove_output(second_output);
+    settle(&mut f);
+    assert_eq!(f.connection().window(window).dims, dimensions);
+}
+
+#[test]
+fn output_membership_orders_preserve_repeated_fullscreen_frame() {
+    for (enabled, base) in [(true, 1.0), (true, 1.5), (false, 1.0)] {
+        for entered in [[0, 1], [1, 0]] {
+            let (mut f, comp, outputs) = three_outputs_with_scaling(ScalingConfig {
+                enabled,
+                base_scale: Some(base),
+            });
+            let window = Window::new(1);
+            let (_, id) = f.create_toplevel(&comp, window);
+            let surface = f.testwl.get_surface_data(id).unwrap().surface.clone();
+            for index in entered {
+                surface.enter(&outputs[index].1);
+            }
+            surface.leave(&outputs[1].1);
+            settle(&mut f);
+
+            for _ in 0..3 {
+                for (width, height, states) in [
+                    (3440, 1440, vec![xdg_toplevel::State::Fullscreen]),
+                    (1280, 720, vec![]),
+                ] {
+                    f.testwl.configure_toplevel(id, width, height, states);
+                    settle(&mut f);
+                    assert_eq!(
+                        f.connection().window(window).dims,
+                        WindowDims {
+                            x: 0,
+                            y: (720.0 * base) as i16,
+                            width: (width as f64 * base) as u16,
+                            height: (height as f64 * base) as u16,
+                        },
+                        "enabled={enabled} base={base} entered={entered:?}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn output_membership_normal_move_accepts_both_notification_orders() {
+    for (enabled, base) in [(true, 1.0), (true, 1.5), (false, 1.0)] {
+        for leave_first in [false, true] {
+            let (mut f, comp, outputs) = three_outputs_with_scaling(ScalingConfig {
+                enabled,
+                base_scale: Some(base),
+            });
+            let window = Window::new(1);
+            let (_, id) = f.create_toplevel(&comp, window);
+            let surface = f.testwl.get_surface_data(id).unwrap().surface.clone();
+            surface.enter(&outputs[0].1);
+            settle(&mut f);
+
+            for (from, to, x) in [(0, 1, 3440.0), (1, 0, 0.0)] {
+                if leave_first {
+                    surface.leave(&outputs[from].1);
+                    settle(&mut f);
+                    surface.enter(&outputs[to].1);
+                } else {
+                    surface.enter(&outputs[to].1);
+                    surface.leave(&outputs[from].1);
+                }
+                settle(&mut f);
+                f.testwl.configure_toplevel(id, 640, 480, vec![]);
+                settle(&mut f);
+                let dims = f.connection().window(window).dims;
+                assert_eq!(
+                    (dims.x, dims.y),
+                    ((x * base) as i16, (720.0 * base) as i16),
+                    "enabled={enabled} base={base} leave_first={leave_first}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn output_membership_removed_output_retains_surviving_output() {
+    for (enabled, base) in [(true, 1.0), (true, 1.5), (false, 1.0)] {
+        for entered in [[0, 1], [1, 0]] {
+            let (mut f, comp, outputs) = three_outputs_with_scaling(ScalingConfig {
+                enabled,
+                base_scale: Some(base),
+            });
+            let window = Window::new(1);
+            let (_, id) = f.create_toplevel(&comp, window);
+            let surface = f.testwl.get_surface_data(id).unwrap().surface.clone();
+            for index in entered {
+                surface.enter(&outputs[index].1);
+            }
+            settle(&mut f);
+            f.remove_output(outputs[1].1.clone());
+            settle(&mut f);
+            f.testwl
+                .configure_toplevel(id, 3440, 1440, vec![xdg_toplevel::State::Fullscreen]);
+            settle(&mut f);
+            assert_eq!(
+                f.connection().window(window).dims,
+                WindowDims {
+                    x: 0,
+                    y: (720.0 * base) as i16,
+                    width: (3440.0 * base) as u16,
+                    height: (1440.0 * base) as u16,
+                },
+                "enabled={enabled} base={base} entered={entered:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn output_membership_keeps_nested_popups_in_parent_frame() {
+    for (enabled, base) in [(true, 1.0), (true, 1.5), (false, 1.0)] {
+        let (mut f, comp, outputs) = three_outputs_with_scaling(ScalingConfig {
+            enabled,
+            base_scale: Some(base),
+        });
+        let root = Window::new(1);
+        let (_, root_id) = f.create_toplevel(&comp, root);
+        let root_surface = f.testwl.get_surface_data(root_id).unwrap().surface.clone();
+        root_surface.enter(&outputs[0].1);
+        settle(&mut f);
+        let root_dims = f.connection().window(root).dims;
+        let x = root_dims.x + (60.0 * base) as i16;
+        let y = root_dims.y + (60.0 * base) as i16;
+        let first = Window::new(2);
+        let (_, first_id) = f.create_popup(
+            &comp,
+            PopupBuilder::new(first, root, root_id)
+                .x(x)
+                .y(y)
+                .width(90)
+                .height(90)
+                .scale(base),
+        );
+        let nested = Window::new(3);
+        let delta = (30.0 * base) as i16;
+        let (_, nested_id) = f.create_popup(
+            &comp,
+            PopupBuilder::new(nested, first, first_id)
+                .transient_for(first)
+                .x(x + delta)
+                .y(y + delta)
+                .width(30)
+                .height(30)
+                .scale(base),
+        );
+        settle(&mut f);
+        let first_before = f.connection().window(first).dims;
+        let nested_before = f.connection().window(nested).dims;
+        for id in [first_id, nested_id] {
+            let surface = f.testwl.get_surface_data(id).unwrap().surface.clone();
+            surface.enter(&outputs[0].1);
+            surface.enter(&outputs[1].1);
+            surface.leave(&outputs[1].1);
+        }
+        settle(&mut f);
+        assert_eq!(f.connection().window(first).dims, first_before);
+        assert_eq!(f.connection().window(nested).dims, nested_before);
+
+        root_surface.enter(&outputs[1].1);
+        root_surface.leave(&outputs[0].1);
+        settle(&mut f);
+        let shift = (3440.0 * base) as i16;
+        for (window, before) in [(first, first_before), (nested, nested_before)] {
+            let dims = f.connection().window(window).dims;
+            assert_eq!(
+                dims,
+                WindowDims {
+                    x: before.x + shift,
+                    ..before
+                },
+                "enabled={enabled} base={base} window={window:?}",
+            );
+        }
+    }
 }

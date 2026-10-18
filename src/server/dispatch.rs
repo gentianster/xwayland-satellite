@@ -427,6 +427,14 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                 }
             }
             Request::<WlSurface>::Destroy => {
+                // The X window can outlive this surface. Its next surface
+                // must not inherit visibility or an output choice from this one.
+                if data.has::<event::EnteredOutputs>() {
+                    cmd.remove_one::<event::EnteredOutputs>(*entity);
+                }
+                if data.has::<event::OnOutput>() {
+                    cmd.remove_one::<event::OnOutput>(*entity);
+                }
                 if let Some(cache) = data.get::<&ScaledRegion>() {
                     if let Some(region) = &cache.client {
                         region.destroy();

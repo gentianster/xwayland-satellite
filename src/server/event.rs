@@ -279,72 +279,17 @@ impl SurfaceEvents {
         let connection = &mut state.connection;
         let state = &mut state.inner;
 
-        let data = state.world.entity(target).unwrap();
-        let surface = data.get::<&WlSurface>().unwrap();
-        let mut cmd = CommandBuffer::new();
+        let surface = (*state.world.get::<&WlSurface>(target).unwrap()).clone();
         match event {
             Event::Enter { output } => {
                 let output_entity = output.data().copied().unwrap();
-                let Ok(output_data) = state.world.entity(output_entity) else {
+                let Ok(output) = state.world.get::<&WlOutput>(output_entity) else {
                     return;
                 };
-                let Some(output) = output_data.get::<&WlOutput>() else {
-                    return;
-                };
-
                 surface.enter(&output);
-                let on_output = OnOutput(output_entity);
-
                 debug!("{} entered {}", surface.id(), output.id());
-
-                let mut query = data.query::<(&x::Window, &mut WindowData)>();
-                if let Some((window, win_data)) = query.get() {
-                    let Some(dimensions) = output_data.get::<&OutputDimensions>() else {
-                        return;
-                    };
-                    if !state.scaling_config.enabled || scaled_output_batches_ready(&state.world) {
-                        win_data.update_output_offset(
-                            *window,
-                            WindowOutputOffset {
-                                x: ((dimensions.x - state.global_output_offset.x.value) as f64
-                                    * if state.scaling_config.enabled {
-                                        state.current_scale
-                                    } else {
-                                        1.0
-                                    })
-                                .round() as i32,
-                                y: ((dimensions.y - state.global_output_offset.y.value) as f64
-                                    * if state.scaling_config.enabled {
-                                        state.current_scale
-                                    } else {
-                                        1.0
-                                    })
-                                .round() as i32,
-                            },
-                            data.get::<&SurfaceRole>()
-                                .is_some_and(|role| matches!(*role, SurfaceRole::Popup(_))),
-                            connection,
-                        );
-                    } else {
-                        state.scaled_outputs_dirty = true;
-                    }
-                    if state.last_focused_toplevel == Some(*window) {
-                        let output = get_output_name(Some(&on_output), &state.world);
-                        debug!("focused window changed outputs - resetting primary output");
-                        connection.focus_window(*window, output);
-                    }
-
-                    if state.fractional_scale.is_none() && !state.scaling_config.enabled {
-                        let output_scale = output_data.get::<&OutputScaleFactor>().unwrap().get();
-                        data.get::<&mut SurfaceScaleFactor>().unwrap().0 = output_scale;
-                        drop(query);
-                        update_surface_viewport(
-                            &state.world,
-                            state.world.query_one(target).unwrap(),
-                        );
-                    }
-                }
-                cmd.insert_one(target, on_output);
+                drop(output);
+                update_surface_output_membership(target, output_entity, true, state, connection);
             }
             Event::Leave { output } => {
                 let output_entity = output.data().copied().unwrap();
@@ -352,19 +297,12 @@ impl SurfaceEvents {
                     return;
                 };
                 surface.leave(&output);
-                if data
-                    .get::<&OnOutput>()
-                    .is_some_and(|o| o.0 == output_entity)
-                {
-                    cmd.remove_one::<OnOutput>(target);
-                }
+                drop(output);
+                update_surface_output_membership(target, output_entity, false, state, connection);
             }
             Event::PreferredBufferScale { .. } => {}
             other => warn!("unhandled surface request: {other:?}"),
         }
-
-        drop(surface);
-        cmd.run_on(&mut state.world);
     }
 
     fn xdg_event<C: XConnection>(
@@ -1126,6 +1064,93 @@ impl Event for client::wl_touch::Event {
                     ]
                 }
             }
+        }
+    }
+}
+
+// Enter reports visibility, not a new primary output. Keep the selected
+// output while it remains entered so overlap does not move the X11 frame
+// into a neighboring output and beyond the X root's input bounds.
+#[derive(Default)]
+pub(super) struct EnteredOutputs(pub(super) Vec<Entity>);
+
+pub(super) fn update_surface_output_membership<C: XConnection>(
+    target: Entity,
+    output: Entity,
+    entered: bool,
+    state: &mut InnerServerState<C::X11Selection>,
+    connection: &mut C,
+) {
+    let previous = state.world.get::<&OnOutput>(target).ok().map(|o| o.0);
+    let mut outputs = state
+        .world
+        .get::<&EnteredOutputs>(target)
+        .map(|o| o.0.clone())
+        .unwrap_or_default();
+    if entered {
+        if !outputs.contains(&output) {
+            outputs.push(output);
+        }
+    } else {
+        outputs.retain(|o| *o != output);
+    }
+    outputs.retain(|o| state.world.get::<&OutputDimensions>(*o).is_ok());
+    let selected = previous
+        .filter(|o| outputs.contains(o))
+        .or_else(|| outputs.first().copied());
+    state
+        .world
+        .insert_one(target, EnteredOutputs(outputs))
+        .unwrap();
+    if previous == selected {
+        return;
+    }
+    let Some(selected) = selected else {
+        // With no visible output, retain the X frame until the next enter,
+        // without treating the previous output as a current membership.
+        let _ = state.world.remove_one::<OnOutput>(target);
+        return;
+    };
+    state.world.insert_one(target, OnOutput(selected)).unwrap();
+    let dimensions = state.world.get::<&OutputDimensions>(selected).unwrap();
+    let data = state.world.entity(target).unwrap();
+    let mut query = data.query::<(&x::Window, &mut WindowData)>();
+    if let Some((window, win_data)) = query.get() {
+        if !state.scaling_config.enabled || scaled_output_batches_ready(&state.world) {
+            let base = if state.scaling_config.enabled {
+                state.current_scale
+            } else {
+                1.0
+            };
+            win_data.update_output_offset(
+                *window,
+                WindowOutputOffset {
+                    x: ((dimensions.x - state.global_output_offset.x.value) as f64 * base).round()
+                        as i32,
+                    y: ((dimensions.y - state.global_output_offset.y.value) as f64 * base).round()
+                        as i32,
+                },
+                data.get::<&SurfaceRole>()
+                    .is_some_and(|role| matches!(*role, SurfaceRole::Popup(_))),
+                connection,
+            );
+        } else {
+            state.scaled_outputs_dirty = true;
+        }
+        if state.last_focused_toplevel == Some(*window) {
+            connection.focus_window(
+                *window,
+                get_output_name(Some(&OnOutput(selected)), &state.world),
+            );
+        }
+        if state.fractional_scale.is_none() && !state.scaling_config.enabled {
+            data.get::<&mut SurfaceScaleFactor>().unwrap().0 = state
+                .world
+                .get::<&OutputScaleFactor>(selected)
+                .unwrap()
+                .get();
+            drop(query);
+            update_surface_viewport(&state.world, state.world.query_one(target).unwrap());
         }
     }
 }

@@ -1636,6 +1636,11 @@ fn primary_output() {
     assert_eq!(reply.output(), output2);
 
     let wl_output3 = f.create_output(24, 46);
+    f.testwl
+        .get_surface_data(surface2)
+        .unwrap()
+        .surface
+        .leave(&wl_output2);
     f.testwl.move_surface_to_output(surface2, &wl_output3);
     std::thread::sleep(std::time::Duration::from_millis(10));
 
@@ -2738,4 +2743,127 @@ fn compositor_scaling_fixed_fractional_mixed_input_popup_resize() {
 #[test]
 fn compositor_scaling_auto_max_mixed_input_popup_resize() {
     mixed_scaling_roundtrip(None);
+}
+
+#[test]
+fn fullscreen_overlapping_output_keeps_real_xwayland_right_bottom_pixel_reachable() {
+    let mut f = Fixture::new_scaled(
+        |wl| wl.enable_fractional_scale(),
+        xwls::ScalingConfig {
+            enabled: true,
+            base_scale: Some(1.5),
+        },
+    );
+    f.testwl.enable_xdg_output_manager();
+    let mut outputs = Vec::new();
+    for (name, x, y, width, height, logical_width, logical_height, integer_scale) in [
+        ("DP-3", 0, 720, 3440, 1440, 3440, 1440, 1),
+        ("DP-1", 3440, 720, 3840, 2160, 2560, 1440, 2),
+        ("HDMI-A-1", 2160, 0, 1920, 1080, 1280, 720, 2),
+    ] {
+        let output = f.create_output(x, y);
+        f.dispatch_until_quiet();
+        output.name(name.into());
+        output.mode(wl_output::Mode::Current, width, height, 60000);
+        output.scale(integer_scale);
+        let xdg = f.testwl.get_xdg_output(&output).unwrap();
+        xdg.logical_position(x, y);
+        xdg.logical_size(logical_width, logical_height);
+        xdg.done();
+        output.done();
+        f.dispatch_until_quiet();
+        outputs.push(output);
+    }
+
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 200, 160, false);
+    let surface = f.map_as_toplevel_with_scale(&mut connection, window, 1.5);
+    f.testwl.move_surface_to_output(surface, &outputs[0]);
+    f.dispatch_until_quiet();
+    f.testwl.configure_toplevel(
+        surface,
+        3440,
+        1440,
+        vec![
+            xdg_toplevel::State::Activated,
+            xdg_toplevel::State::Fullscreen,
+        ],
+    );
+    f.dispatch_until_quiet();
+
+    let wl_surface = f.testwl.get_surface_data(surface).unwrap().surface.clone();
+    wl_surface.enter(&outputs[1]);
+    f.dispatch_until_quiet();
+    connection
+        .send_and_check_request(&x::ChangeWindowAttributes {
+            window,
+            value_list: &[x::Cw::EventMask(x::EventMask::BUTTON_PRESS)],
+        })
+        .unwrap();
+
+    for overlapping in [true, false] {
+        if !overlapping {
+            wl_surface.leave(&outputs[1]);
+            f.dispatch_until_quiet();
+        }
+        f.testwl.move_pointer_to(surface, 3439.5, 1439.5);
+        let pointer = f.testwl.pointer();
+        pointer.motion(100, 3439.5, 1439.5);
+        pointer.frame();
+        f.dispatch_until_quiet();
+
+        let root = connection.get_reply(&x::GetGeometry {
+            drawable: x::Drawable::Window(connection.root),
+        });
+        let geometry = connection.get_reply(&x::GetGeometry {
+            drawable: x::Drawable::Window(window),
+        });
+        let position = connection.get_reply(&x::QueryPointer { window });
+        eprintln!(
+            "overlapping={overlapping}, X root={}x{}, fullscreen={}x{}+{}+{}, pointer root=({},{}), local=({},{})",
+            root.width(),
+            root.height(),
+            geometry.width(),
+            geometry.height(),
+            geometry.x(),
+            geometry.y(),
+            position.root_x(),
+            position.root_y(),
+            position.win_x(),
+            position.win_y(),
+        );
+        assert!(position.same_screen());
+        assert_eq!((root.width(), root.height()), (9000, 3240));
+        assert_eq!(
+            (position.win_x(), position.win_y()),
+            (5159, 2159),
+            "the last fullscreen pixel must remain reachable through real Xwayland (overlapping={overlapping})",
+        );
+        assert_eq!((position.root_x(), position.root_y()), (5159, 3239));
+        assert_eq!(
+            (
+                geometry.x(),
+                geometry.y(),
+                geometry.width(),
+                geometry.height()
+            ),
+            (0, 1080, 5160, 2160),
+        );
+        assert!(i32::from(geometry.x()) + i32::from(geometry.width()) <= i32::from(root.width()));
+        assert!(i32::from(geometry.y()) + i32::from(geometry.height()) <= i32::from(root.height()));
+
+        let pointer = f.testwl.pointer();
+        pointer.button(101, 101, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+        pointer.frame();
+        pointer.button(102, 102, BTN_LEFT, wl_pointer::ButtonState::Released);
+        pointer.frame();
+        f.dispatch_until_quiet();
+        match connection.await_event() {
+            xcb::Event::X(x::Event::ButtonPress(event)) => {
+                assert_eq!(event.event(), window);
+                assert_eq!((event.event_x(), event.event_y()), (5159, 2159));
+            }
+            other => panic!("expected a click at the last fullscreen pixel, got {other:?}"),
+        }
+    }
 }

@@ -695,7 +695,7 @@ impl<C: XConnection> ServerState<C> {
 
     pub fn handle_clientside_events(&mut self) {
         let previous_base = self.current_scale;
-        self.handle_globals();
+        self.inner.handle_globals(&mut self.connection);
 
         for (target, event) in self.world.read_events() {
             if !self.world.contains(target) {
@@ -1034,7 +1034,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.queue.as_fd()
     }
 
-    fn handle_globals(&mut self) {
+    fn handle_globals<C: XConnection<X11Selection = S>>(&mut self, connection: &mut C) {
         let globals = std::mem::take(&mut self.world.new_globals);
         handle_new_globals::<S>(&mut self.globals_map, &self.dh, &globals);
 
@@ -1043,12 +1043,16 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             let (global_struct, global_id) = self.globals_map.remove(&global).unwrap();
             self.dh.disable_global::<InnerServerState<S>>(global_id);
             if global_struct.interface == <WlOutput>::interface().name {
-                self.remove_output(global);
+                self.remove_output(global, connection);
             }
         }
     }
 
-    fn remove_output(&mut self, global: GlobalName) {
+    fn remove_output<C: XConnection<X11Selection = S>>(
+        &mut self,
+        global: GlobalName,
+        connection: &mut C,
+    ) {
         let query = self
             .world
             .query_mut::<(&WlOutput, &GlobalName)>()
@@ -1061,16 +1065,16 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 self.world
                     .remove::<(OutputScaleFactor, OutputDimensions)>(*entity)
                     .unwrap();
-                let query = self
+                let surfaces = self
                     .world
-                    .query_mut::<&OnOutput>()
-                    .into_iter()
-                    .map(|(e, on_out)| (e, *on_out))
+                    .query::<&EnteredOutputs>()
+                    .iter()
+                    .filter_map(|(e, outputs)| outputs.0.contains(entity).then_some(e))
                     .collect::<Vec<_>>();
-                for (e, on_out) in query.iter() {
-                    if *on_out == OnOutput(*entity) {
-                        self.world.remove_one::<OnOutput>(*e).unwrap();
-                    }
+                for surface in surfaces {
+                    event::update_surface_output_membership(
+                        surface, *entity, false, self, connection,
+                    );
                 }
                 if self.global_output_offset.x.owner == Some(*entity) {
                     self.global_offset_updated = true;
