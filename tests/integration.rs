@@ -18,11 +18,12 @@ use wayland_server::Resource;
 use wayland_server::protocol::{wl_output, wl_pointer};
 use xcb::{Xid, x};
 use xwayland_satellite as xwls;
-use xwayland_satellite::xstate::{MoveResizeDirection, WmSizeHintsFlags, WmState};
+use xwayland_satellite::xstate::{MoveResizeDirection, SetState, WmSizeHintsFlags, WmState};
 use xwls::timespec_from_millis;
 
 #[derive(Default)]
 struct TestDataInner {
+    scaling: xwls::ScalingConfig,
     server_created: AtomicBool,
     server_connected: AtomicBool,
     display: Mutex<Option<String>>,
@@ -35,8 +36,9 @@ struct TestDataInner {
 struct TestData(Arc<TestDataInner>);
 
 impl TestData {
-    fn new(server: UnixStream, quit_rx: UnixStream) -> Self {
+    fn new(server: UnixStream, quit_rx: UnixStream, scaling: xwls::ScalingConfig) -> Self {
         Self(Arc::new(TestDataInner {
+            scaling,
             server: Mutex::new(server.into()),
             quit_rx: Mutex::new(Some(quit_rx)),
             ..Default::default()
@@ -52,6 +54,9 @@ impl std::ops::Deref for TestData {
 }
 
 impl xwls::RunData for TestData {
+    fn scaling_config(&self) -> xwls::ScalingConfig {
+        self.scaling
+    }
     fn created_server(&self) {
         self.server_created.store(true, Ordering::Relaxed);
     }
@@ -123,6 +128,12 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new_preset(pre_connect: impl FnOnce(&mut testwl::Server)) -> Self {
+        Self::new_scaled(pre_connect, Default::default())
+    }
+    fn new_scaled(
+        pre_connect: impl FnOnce(&mut testwl::Server),
+        scaling: xwls::ScalingConfig,
+    ) -> Self {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             pretty_env_logger::formatted_timed_builder()
@@ -138,7 +149,7 @@ impl Fixture {
         let mut testwl = testwl::Server::new(false);
         pre_connect(&mut testwl);
         testwl.connect(a);
-        let our_data = TestData::new(b, quit_rx);
+        let our_data = TestData::new(b, quit_rx, scaling);
         let data = our_data.clone();
         let thread = std::thread::spawn(move || xwls::main(data));
 
@@ -204,13 +215,6 @@ impl Fixture {
         let mut pollfd = [self.pollfd.clone()];
         self.testwl.dispatch();
         let timeout = timespec_from_millis(50);
-        assert!(
-            poll(&mut pollfd, Some(&timeout)).unwrap() > 0,
-            "Did not receive any events"
-        );
-        self.pollfd.clear_revents();
-        self.testwl.dispatch();
-
         while poll(&mut pollfd, Some(&timeout)).unwrap() > 0 {
             self.testwl.dispatch();
             self.pollfd.clear_revents();
@@ -349,6 +353,30 @@ impl Fixture {
         self.wait_and_dispatch();
         self.testwl.finalize_output(x, y)
     }
+
+    fn set_fractional_output_scale(&mut self, output: &wl_output::WlOutput, scale: f64) {
+        let physical = (1000.0 * scale) as i32;
+        output.mode(wl_output::Mode::Current, physical, physical, 60000);
+        output.scale(scale.ceil() as i32);
+        self.testwl
+            .get_xdg_output(output)
+            .unwrap()
+            .logical_size(1000, 1000);
+        output.done();
+        self.dispatch_until_quiet();
+    }
+
+    fn dispatch_until_quiet(&mut self) {
+        // An output-only DPI update can finish through X11 properties without
+        // producing another Wayland request while no surfaces are mapped.
+        self.testwl.dispatch();
+        let mut fds = [self.pollfd.clone()];
+        let timeout = timespec_from_millis(50);
+        while poll(&mut fds, Some(&timeout)).unwrap() > 0 {
+            self.testwl.dispatch();
+            self.pollfd.clear_revents();
+        }
+    }
 }
 
 xcb::atoms_struct! {
@@ -358,6 +386,9 @@ xcb::atoms_struct! {
         wm_delete_window => b"WM_DELETE_WINDOW",
         net_wm_state => b"_NET_WM_STATE",
         skip_taskbar => b"_NET_WM_STATE_SKIP_TASKBAR",
+        maximized_vert => b"_NET_WM_STATE_MAXIMIZED_VERT" only_if_exists = false,
+        maximized_horz => b"_NET_WM_STATE_MAXIMIZED_HORZ" only_if_exists = false,
+        wm_change_state => b"WM_CHANGE_STATE" only_if_exists = false,
         transient_for => b"WM_TRANSIENT_FOR",
         clipboard => b"CLIPBOARD",
         primary => b"PRIMARY",
@@ -715,6 +746,28 @@ impl Connection {
         .value()
         .to_vec()
     }
+}
+
+#[test]
+fn dispatch_already_queued_request() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, window);
+
+    connection.set_property(window, x::ATOM_STRING, x::ATOM_WM_NAME, b"queued");
+    let timeout = timespec_from_millis(1000);
+    assert!(poll(&mut [f.pollfd.clone()], Some(&timeout)).unwrap() > 0);
+    f.wait_and_dispatch();
+    assert_eq!(
+        f.testwl
+            .get_surface_data(surface)
+            .unwrap()
+            .toplevel()
+            .title
+            .as_deref(),
+        Some("queued")
+    );
 }
 
 #[test]
@@ -1596,6 +1649,11 @@ fn primary_output() {
     assert_eq!(reply.output(), output2);
 
     let wl_output3 = f.create_output(24, 46);
+    f.testwl
+        .get_surface_data(surface2)
+        .unwrap()
+        .surface
+        .leave(&wl_output2);
     f.testwl.move_surface_to_output(surface2, &wl_output3);
     std::thread::sleep(std::time::Duration::from_millis(10));
 
@@ -2148,8 +2206,12 @@ fn xsettings_fractional_scale() {
     f.testwl.enable_xdg_output_manager();
     let output = f.create_output(0, 0); // WL-1
 
+    // Output DPI must reach XSETTINGS before any surface enters the monitor.
+    f.set_fractional_output_scale(&output, 1.5);
+    assert_eq!(connection.get_xsettings().data["Xft/DPI"].value, 144 * 1024);
+
     let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
-    let surface = f.map_as_toplevel(&mut connection, window);
+    let surface = f.map_as_toplevel_with_scale(&mut connection, window, 1.5);
 
     let data = f
         .testwl
@@ -2181,6 +2243,14 @@ fn xsettings_fractional_scale() {
     fractional.preferred_scale(300); // 2.5 scale
     f.wait_and_dispatch();
 
+    // Surface preferences size the viewport, not the global X11 settings.
+    let settings = connection.get_xsettings();
+    assert_eq!(settings.data["Xft/DPI"].value, 144 * 1024);
+    assert_eq!(settings.data["Gdk/WindowScalingFactor"].value, 1);
+    assert_eq!(settings.data["Gdk/UnscaledDPI"].value, 144 * 1024);
+
+    f.set_fractional_output_scale(&output, 2.5);
+
     let settings = connection.get_xsettings();
     assert_eq!(
         settings.data["Xft/DPI"].value,
@@ -2210,8 +2280,15 @@ fn resource_manager_scale() {
         b"Xcursor.theme:\tAdwaita\nXft.dpi:\t96\n",
     );
 
+    // Preserve unrelated resources while updating DPI without a mapped window.
+    f.set_fractional_output_scale(&output, 1.5);
+    assert_eq!(
+        connection.get_resource_manager(),
+        b"Xcursor.theme:\tAdwaita\nXft.dpi:\t144\n"
+    );
+
     let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
-    let surface = f.map_as_toplevel(&mut connection, window);
+    let surface = f.map_as_toplevel_with_scale(&mut connection, window, 1.5);
     let data = f.testwl.get_surface_data(surface).unwrap();
     let fractional = data.fractional.as_ref().unwrap();
 
@@ -2227,6 +2304,12 @@ fn resource_manager_scale() {
     let fractional = data.fractional.as_ref().unwrap();
     fractional.preferred_scale(300); // 2.5 scale
     f.wait_and_dispatch();
+    assert_eq!(
+        connection.get_resource_manager(),
+        b"Xcursor.theme:\tAdwaita\nXft.dpi:\t144\n"
+    );
+
+    f.set_fractional_output_scale(&output, 2.5);
     assert_eq!(
         connection.get_resource_manager(),
         b"Xcursor.theme:\tAdwaita\nXft.dpi:\t240\n"
@@ -2409,4 +2492,795 @@ fn client_init_resize() {
         "Got wrong resizing edge: {:?}",
         data.resizing
     );
+}
+
+/// EWMH lets clients leave the button field unspecified (0), which is what every
+/// Chromium/Electron app does when dragging its titlebar.
+#[test]
+fn client_init_move_unspecified_button() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+    f.testwl.move_pointer_to(surface, 10., 10.);
+    let ptr = f.testwl.pointer();
+    ptr.motion(10, 10.0, 10.0);
+    ptr.frame();
+    ptr.button(10, 20, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+    ptr.frame();
+    f.testwl.dispatch();
+
+    connection.send_client_message(&x::ClientMessageEvent::new(
+        win_toplevel,
+        connection.atoms.moveresize,
+        x::ClientMessageData::Data32([0, 0, MoveResizeDirection::Move.into(), 0, 0]),
+    ));
+
+    f.wait_and_dispatch();
+    let data = f.testwl.get_surface_data(surface).unwrap();
+    assert!(data.moving);
+}
+
+#[test]
+fn client_maximize() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+
+    let set_maximized = |f: &mut Fixture, action: SetState| {
+        connection.send_client_message(&x::ClientMessageEvent::new(
+            win_toplevel,
+            connection.atoms.net_wm_state,
+            x::ClientMessageData::Data32([
+                action as u32,
+                connection.atoms.maximized_vert.resource_id(),
+                connection.atoms.maximized_horz.resource_id(),
+                0,
+                0,
+            ]),
+        ));
+        f.wait_and_dispatch();
+
+        let maximized = f
+            .testwl
+            .get_surface_data(surface)
+            .unwrap()
+            .toplevel()
+            .states
+            .contains(&xdg_toplevel::State::Maximized);
+
+        // The compositor's answer has to make it back onto _NET_WM_STATE, or the client
+        // will keep drawing itself (titlebar buttons included) as if it were unmaximized.
+        let reply = connection.get_reply(&x::GetProperty {
+            delete: false,
+            window: win_toplevel,
+            property: connection.atoms.net_wm_state,
+            r#type: x::ATOM_ATOM,
+            long_offset: 0,
+            long_length: 8,
+        });
+        let states = reply.value::<x::Atom>();
+        assert_eq!(
+            states.contains(&connection.atoms.maximized_vert),
+            maximized,
+            "_NET_WM_STATE ({states:?}) disagrees with the toplevel state"
+        );
+        assert_eq!(
+            states.contains(&connection.atoms.maximized_horz),
+            maximized,
+            "_NET_WM_STATE ({states:?}) disagrees with the toplevel state"
+        );
+
+        maximized
+    };
+
+    assert!(set_maximized(&mut f, SetState::Add));
+    assert!(!set_maximized(&mut f, SetState::Remove));
+    assert!(set_maximized(&mut f, SetState::Toggle));
+    assert!(!set_maximized(&mut f, SetState::Toggle));
+}
+
+#[test]
+fn client_minimize() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+    assert!(!f.testwl.get_surface_data(surface).unwrap().minimized);
+
+    // This is what XIconifyWindow sends.
+    connection.send_client_message(&x::ClientMessageEvent::new(
+        win_toplevel,
+        connection.atoms.wm_change_state,
+        x::ClientMessageData::Data32([WmState::Iconic as u32, 0, 0, 0, 0]),
+    ));
+
+    f.wait_and_dispatch();
+    assert!(f.testwl.get_surface_data(surface).unwrap().minimized);
+}
+
+#[test]
+fn popup_parent_frame_survives_mixed_output_enter() {
+    let mut f = Fixture::new_preset(|wl| wl.enable_fractional_scale());
+    f.testwl.enable_xdg_output_manager();
+    f.create_output(2160, 0);
+    let left = f.create_output(0, 720);
+    let right = f.create_output(3440, 720);
+    f.set_fractional_output_scale(&right, 1.5);
+    let mut conn = Connection::new(&f.display);
+    let root = conn.new_window(conn.root, 0, 0, 2961, 1852, false);
+    let root_id = f.map_as_toplevel(&mut conn, root);
+    f.testwl.move_surface_to_output(root_id, &left);
+    f.testwl
+        .get_surface_data(root_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .unwrap()
+        .preferred_scale(180);
+    f.dispatch_until_quiet();
+    let first = conn.new_window(conn.root, 241, 748, 800, 1412, true);
+    let first_id = f.map_as_popup(&mut conn, first);
+    f.testwl.move_surface_to_output(first_id, &right);
+    f.dispatch_until_quiet();
+    let a = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(first),
+    });
+    // Logical popup dimensions round up before projection back into X pixels.
+    assert_eq!((a.x(), a.y(), a.width(), a.height()), (240, 747, 801, 1413));
+    let next_x = (a.x() as i32 + a.width() as i32).min(3440 - 800) as i16;
+    let second = conn.new_window(conn.root, next_x, 798, 800, 1317, true);
+    let second_id = f.map_as_popup(&mut conn, second);
+    f.testwl.move_surface_to_output(second_id, &right);
+    f.dispatch_until_quiet();
+    let b = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(second),
+    });
+    assert!((b.x() as i32 - a.x() as i32 - a.width() as i32).abs() <= 2);
+    assert_eq!(conn.get_xsettings().data["Xft/DPI"].value, 96 * 1024);
+}
+
+// Real Xwayland, with the three physical/logical monitor geometries in use.
+// X11 output dimensions and local input are both logical units multiplied by B.
+fn mixed_scaling_roundtrip(base: Option<f64>) {
+    let b = base.unwrap_or(1.5);
+    let mut f = Fixture::new_scaled(
+        |wl| wl.enable_fractional_scale(),
+        xwls::ScalingConfig {
+            enabled: true,
+            base_scale: base,
+        },
+    );
+    f.testwl.enable_xdg_output_manager();
+    let mut outputs = Vec::new();
+    for (x, y, w, h, lw, lh, integer) in [
+        (0, 720, 3440, 1440, 3440, 1440, 1),
+        (3440, 720, 3840, 2160, 2560, 1440, 2),
+        (2160, 0, 1920, 1080, 1280, 720, 2),
+    ] {
+        let output = f.create_output(x, y);
+        f.dispatch_until_quiet();
+        output.mode(wl_output::Mode::Current, w, h, 144000);
+        output.scale(integer);
+        f.testwl
+            .get_xdg_output(&output)
+            .expect("xdg output bound")
+            .logical_size(lw, lh);
+        output.done();
+        f.dispatch_until_quiet();
+        outputs.push(output);
+    }
+    let mut conn = Connection::new(&f.display);
+    assert_eq!(
+        conn.get_xsettings().data["Xft/DPI"].value,
+        (96.0 * 1024.0 * b) as i32
+    );
+    let root = conn.new_window(conn.root, 0, 0, 200, 160, false);
+    let root_id = f.map_as_toplevel_with_scale(&mut conn, root, b as f32);
+    for output in &outputs {
+        f.testwl.move_surface_to_output(root_id, output);
+        f.testwl
+            .get_surface_data(root_id)
+            .unwrap()
+            .fractional
+            .as_ref()
+            .unwrap()
+            .preferred_scale(120);
+        f.testwl.move_pointer_to(root_id, 24.0, 30.0);
+        f.dispatch_until_quiet();
+        let ptr = conn.get_reply(&x::QueryPointer { window: root });
+        assert!(ptr.same_screen());
+        assert_eq!(
+            (ptr.win_x(), ptr.win_y()),
+            ((24.0 * b) as i16, (30.0 * b) as i16)
+        );
+        assert_eq!(
+            conn.get_xsettings().data["Xft/DPI"].value,
+            (96.0 * 1024.0 * b) as i32
+        );
+    }
+    f.testwl.move_surface_to_output(root_id, &outputs[1]);
+    f.dispatch_until_quiet();
+    f.testwl
+        .configure_toplevel(root_id, 240, 180, vec![xdg_toplevel::State::Activated]);
+    f.dispatch_until_quiet();
+    let geo = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(root),
+    });
+    assert_eq!(
+        (geo.width(), geo.height()),
+        ((240.0 * b) as u16, (180.0 * b) as u16)
+    );
+    let px = (3440.0 * b) as i16 - 30;
+    let py = (720.0 * b) as i16 - 30;
+    let first = conn.new_window(conn.root, px, py, 90, 90, true);
+    conn.set_property(first, x::ATOM_WINDOW, conn.atoms.transient_for, &[root]);
+    let first_id = f.map_as_popup(&mut conn, first);
+    f.testwl.move_surface_to_output(first_id, &outputs[0]);
+    f.dispatch_until_quiet();
+    let a = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(first),
+    });
+    assert_eq!((a.x(), a.y()), (px, py));
+    let nested = conn.new_window(conn.root, px - 15, py - 15, 30, 30, true);
+    conn.set_property(nested, x::ATOM_WINDOW, conn.atoms.transient_for, &[first]);
+    let nested_id = f.map_as_popup(&mut conn, nested);
+    f.testwl.move_surface_to_output(nested_id, &outputs[2]);
+    f.dispatch_until_quiet();
+    let child = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(nested),
+    });
+    assert_eq!((child.x(), child.y()), (px - 15, py - 15));
+    // Removing the high DPI monitors changes only auto B; fixed B stays fixed.
+    f.testwl.remove_output(outputs.pop().unwrap());
+    f.dispatch_until_quiet();
+    f.testwl.remove_output(outputs.pop().unwrap());
+    f.dispatch_until_quiet();
+    let final_b = base.unwrap_or(1.0);
+    assert_eq!(
+        conn.get_xsettings().data["Xft/DPI"].value,
+        (96.0 * 1024.0 * final_b) as i32
+    );
+}
+#[test]
+fn compositor_scaling_fixed_one_mixed_input_popup_resize() {
+    mixed_scaling_roundtrip(Some(1.0));
+}
+#[test]
+fn compositor_scaling_fixed_fractional_mixed_input_popup_resize() {
+    mixed_scaling_roundtrip(Some(1.5));
+}
+#[test]
+fn compositor_scaling_auto_max_mixed_input_popup_resize() {
+    mixed_scaling_roundtrip(None);
+}
+
+#[test]
+fn fullscreen_overlapping_output_keeps_real_xwayland_right_bottom_pixel_reachable() {
+    let mut f = Fixture::new_scaled(
+        |wl| wl.enable_fractional_scale(),
+        xwls::ScalingConfig {
+            enabled: true,
+            base_scale: Some(1.5),
+        },
+    );
+    f.testwl.enable_xdg_output_manager();
+    let mut outputs = Vec::new();
+    for (name, x, y, width, height, logical_width, logical_height, integer_scale) in [
+        ("DP-3", 0, 720, 3440, 1440, 3440, 1440, 1),
+        ("DP-1", 3440, 720, 3840, 2160, 2560, 1440, 2),
+        ("HDMI-A-1", 2160, 0, 1920, 1080, 1280, 720, 2),
+    ] {
+        let output = f.create_output(x, y);
+        f.dispatch_until_quiet();
+        output.name(name.into());
+        output.mode(wl_output::Mode::Current, width, height, 60000);
+        output.scale(integer_scale);
+        let xdg = f.testwl.get_xdg_output(&output).unwrap();
+        xdg.logical_position(x, y);
+        xdg.logical_size(logical_width, logical_height);
+        xdg.done();
+        output.done();
+        f.dispatch_until_quiet();
+        outputs.push(output);
+    }
+
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 200, 160, false);
+    let surface = f.map_as_toplevel_with_scale(&mut connection, window, 1.5);
+    f.testwl.move_surface_to_output(surface, &outputs[0]);
+    f.dispatch_until_quiet();
+    f.testwl.configure_toplevel(
+        surface,
+        3440,
+        1440,
+        vec![
+            xdg_toplevel::State::Activated,
+            xdg_toplevel::State::Fullscreen,
+        ],
+    );
+    f.dispatch_until_quiet();
+
+    let wl_surface = f.testwl.get_surface_data(surface).unwrap().surface.clone();
+    wl_surface.enter(&outputs[1]);
+    f.dispatch_until_quiet();
+    connection
+        .send_and_check_request(&x::ChangeWindowAttributes {
+            window,
+            value_list: &[x::Cw::EventMask(x::EventMask::BUTTON_PRESS)],
+        })
+        .unwrap();
+
+    for overlapping in [true, false] {
+        if !overlapping {
+            wl_surface.leave(&outputs[1]);
+            f.dispatch_until_quiet();
+        }
+        f.testwl.move_pointer_to(surface, 3439.5, 1439.5);
+        let pointer = f.testwl.pointer();
+        pointer.motion(100, 3439.5, 1439.5);
+        pointer.frame();
+        f.dispatch_until_quiet();
+
+        let root = connection.get_reply(&x::GetGeometry {
+            drawable: x::Drawable::Window(connection.root),
+        });
+        let geometry = connection.get_reply(&x::GetGeometry {
+            drawable: x::Drawable::Window(window),
+        });
+        let position = connection.get_reply(&x::QueryPointer { window });
+        eprintln!(
+            "overlapping={overlapping}, X root={}x{}, fullscreen={}x{}+{}+{}, pointer root=({},{}), local=({},{})",
+            root.width(),
+            root.height(),
+            geometry.width(),
+            geometry.height(),
+            geometry.x(),
+            geometry.y(),
+            position.root_x(),
+            position.root_y(),
+            position.win_x(),
+            position.win_y(),
+        );
+        assert!(position.same_screen());
+        assert_eq!((root.width(), root.height()), (9000, 3240));
+        assert_eq!(
+            (position.win_x(), position.win_y()),
+            (5159, 2159),
+            "the last fullscreen pixel must remain reachable through real Xwayland (overlapping={overlapping})",
+        );
+        assert_eq!((position.root_x(), position.root_y()), (5159, 3239));
+        assert_eq!(
+            (
+                geometry.x(),
+                geometry.y(),
+                geometry.width(),
+                geometry.height()
+            ),
+            (0, 1080, 5160, 2160),
+        );
+        assert!(i32::from(geometry.x()) + i32::from(geometry.width()) <= i32::from(root.width()));
+        assert!(i32::from(geometry.y()) + i32::from(geometry.height()) <= i32::from(root.height()));
+
+        let pointer = f.testwl.pointer();
+        pointer.button(101, 101, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+        pointer.frame();
+        pointer.button(102, 102, BTN_LEFT, wl_pointer::ButtonState::Released);
+        pointer.frame();
+        f.dispatch_until_quiet();
+        match connection.await_event() {
+            xcb::Event::X(x::Event::ButtonPress(event)) => {
+                assert_eq!(event.event(), window);
+                assert_eq!((event.event_x(), event.event_y()), (5159, 2159));
+            }
+            other => panic!("expected a click at the last fullscreen pixel, got {other:?}"),
+        }
+    }
+}
+
+struct PositionFixture {
+    f: Fixture,
+    conn: Connection,
+    root: x::Window,
+    surface: testwl::SurfaceId,
+    outputs: Vec<wl_output::WlOutput>,
+    base: f64,
+}
+
+impl PositionFixture {
+    fn new(base: f64) -> Self {
+        let mut f = Fixture::new_scaled(
+            |wl| {
+                wl.enable_fractional_scale();
+                wl.enable_position_protocol();
+            },
+            xwls::ScalingConfig {
+                enabled: true,
+                base_scale: Some(base),
+            },
+        );
+        f.testwl.enable_xdg_output_manager();
+        let mut outputs = Vec::new();
+        for (x, y, width, height, logical_width, logical_height, scale) in [
+            (0, 720, 3440, 1440, 3440, 1440, 1),
+            (3440, 720, 3840, 2160, 2560, 1440, 2),
+            (2160, 0, 1920, 1080, 1280, 720, 2),
+        ] {
+            let output = f.create_output(x, y);
+            f.dispatch_until_quiet();
+            output.mode(wl_output::Mode::Current, width, height, 60000);
+            output.scale(scale);
+            let xdg = f.testwl.get_xdg_output(&output).unwrap();
+            xdg.logical_position(x, y);
+            xdg.logical_size(logical_width, logical_height);
+            xdg.done();
+            output.done();
+            f.dispatch_until_quiet();
+            outputs.push(output);
+        }
+        let mut conn = Connection::new(&f.display);
+        let root = conn.new_window(conn.root, 0, 0, 2010, 1083, false);
+        let surface = f.map_as_toplevel_with_scale(&mut conn, root, base as f32);
+        f.testwl.move_surface_to_output(surface, &outputs[0]);
+        f.dispatch_until_quiet();
+        assert!(
+            f.testwl.position_is_tracked(surface),
+            "exact native root surface must be tracked"
+        );
+        Self {
+            f,
+            conn,
+            root,
+            surface,
+            outputs,
+            base,
+        }
+    }
+
+    fn position(&mut self, epoch: u32, x: f64, y: f64, geometry: (i32, i32)) {
+        self.f
+            .testwl
+            .send_surface_position(self.surface, epoch, x, y, geometry.0, geometry.1);
+        self.f.testwl.position_done(epoch);
+    }
+
+    fn root_geometry(&self) -> (i16, i16, u16, u16) {
+        position_x_geometry(&self.conn, self.root)
+    }
+
+    fn bookmark(&mut self, geometry: (i32, i32)) -> (x::Window, testwl::SurfaceId) {
+        self.position(1, 502.0, 881.0, geometry);
+        self.f.dispatch_until_quiet();
+        assert_eq!(
+            (self.root_geometry().0, self.root_geometry().1),
+            self.project(502.0, 881.0)
+        );
+        self.f.testwl.move_pointer_to(self.surface, 20.0, 20.0);
+        self.f.dispatch_until_quiet();
+        let (x, y) = self.project(506.0, 843.0);
+        let width = (400.0 * self.base) as u16;
+        let height = (1318.0 * self.base) as u16 - 1;
+        let popup = self
+            .conn
+            .new_window(self.conn.root, x, y, width, height, true);
+        let surface = self.f.map_as_popup(&mut self.conn, popup);
+        let native = self.f.testwl.get_surface_data(surface).unwrap().popup();
+        assert_eq!(
+            native.parent,
+            self.f
+                .testwl
+                .get_surface_data(self.surface)
+                .unwrap()
+                .xdg()
+                .surface
+        );
+        assert_eq!(
+            native.positioner_state.offset,
+            testwl::Vec2 {
+                x: 4 - geometry.0,
+                y: -38 - geometry.1
+            }
+        );
+        (popup, surface)
+    }
+
+    fn project(&self, x: f64, y: f64) -> (i16, i16) {
+        (
+            (x * self.base).round() as i16,
+            (y * self.base).round() as i16,
+        )
+    }
+
+    fn queue_pointer_click(&self, surface: testwl::SurfaceId, enter: bool) {
+        let pointer = self.f.testwl.pointer();
+        if enter {
+            let native = &self.f.testwl.get_surface_data(surface).unwrap().surface;
+            pointer.enter(200, native, 148.0, 8.0);
+            pointer.motion(200, 148.0, 8.0);
+            pointer.frame();
+        }
+        pointer.button(201, 201, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+        pointer.frame();
+        pointer.button(202, 202, BTN_LEFT, wl_pointer::ButtonState::Released);
+        pointer.frame();
+    }
+
+    fn assert_click(&mut self, window: x::Window) {
+        self.f.dispatch_until_quiet();
+        let expected = ((148.0 * self.base) as i16, (8.0 * self.base) as i16);
+        let pointer = self.conn.get_reply(&x::QueryPointer { window });
+        let geometry = position_x_geometry(&self.conn, window);
+        eprintln!(
+            "POSITION_INPUT X=({},{},{},{}), root=({},{}), local=({},{})",
+            geometry.0,
+            geometry.1,
+            geometry.2,
+            geometry.3,
+            pointer.root_x(),
+            pointer.root_y(),
+            pointer.win_x(),
+            pointer.win_y()
+        );
+        assert_eq!(
+            (pointer.win_x(), pointer.win_y()),
+            expected,
+            "native local point must remain reachable through real Xwayland"
+        );
+        match self.conn.await_event() {
+            xcb::Event::X(x::Event::ButtonPress(event)) => {
+                assert_eq!(event.event(), window);
+                assert_eq!(
+                    (event.event_x(), event.event_y()),
+                    expected,
+                    "button coordinates must match native local input"
+                );
+            }
+            other => panic!("expected a local popup click, got {other:?}"),
+        }
+    }
+}
+
+fn position_x_geometry(conn: &Connection, window: x::Window) -> (i16, i16, u16, u16) {
+    let geometry = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(window),
+    });
+    (
+        geometry.x(),
+        geometry.y(),
+        geometry.width(),
+        geometry.height(),
+    )
+}
+
+fn position_select_click(conn: &Connection, window: x::Window) {
+    conn.send_and_check_request(&x::ChangeWindowAttributes {
+        window,
+        value_list: &[x::Cw::EventMask(x::EventMask::BUTTON_PRESS)],
+    })
+    .unwrap();
+}
+
+#[test]
+fn native_position_bookmark_first_row_matches_real_x_input() {
+    let mut p = PositionFixture::new(1.5);
+    let (popup, surface) = p.bookmark((0, 0));
+    assert_eq!(position_x_geometry(&p.conn, popup), (759, 1265, 600, 1977));
+    position_select_click(&p.conn, popup);
+    // State, done and the first row input are deliberately in one native batch.
+    p.position(2, 602.0, 981.0, (0, 0));
+    p.queue_pointer_click(surface, true);
+    p.assert_click(popup);
+    assert_eq!(
+        (
+            position_x_geometry(&p.conn, popup).0,
+            position_x_geometry(&p.conn, popup).1
+        ),
+        (909, 1415)
+    );
+}
+
+#[test]
+fn native_position_fallback_sibling_and_nested_keep_native_adjacency() {
+    let mut p = PositionFixture::new(1.5);
+    let (first, first_id) = p.bookmark((0, 0));
+    let first_geometry = position_x_geometry(&p.conn, first);
+    let second = p.conn.new_window(
+        p.conn.root,
+        first_geometry.0 + first_geometry.2 as i16,
+        1322,
+        600,
+        1822,
+        true,
+    );
+    let second_id = p.f.map_as_popup(&mut p.conn, second);
+    let first_native =
+        &p.f.testwl
+            .get_surface_data(first_id)
+            .unwrap()
+            .popup()
+            .positioner_state;
+    let second_native =
+        &p.f.testwl
+            .get_surface_data(second_id)
+            .unwrap()
+            .popup()
+            .positioner_state;
+    assert_eq!(
+        second_native.offset.x,
+        first_native.offset.x + first_native.size.unwrap().x
+    );
+    position_select_click(&p.conn, second);
+    p.queue_pointer_click(second_id, true);
+    p.assert_click(second);
+    let child = p.conn.new_window(
+        p.conn.root,
+        first_geometry.0 + first_geometry.2 as i16,
+        first_geometry.1 + 57,
+        300,
+        600,
+        true,
+    );
+    p.conn
+        .set_property(child, x::ATOM_WINDOW, p.conn.atoms.transient_for, &[first]);
+    let child_id = p.f.map_as_popup(&mut p.conn, child);
+    let native = p.f.testwl.get_surface_data(child_id).unwrap().popup();
+    assert_eq!(
+        native.parent,
+        p.f.testwl.get_surface_data(first_id).unwrap().xdg().surface
+    );
+    assert_eq!(
+        native.positioner_state.offset,
+        testwl::Vec2 { x: 400, y: 38 }
+    );
+    position_select_click(&p.conn, child);
+    p.queue_pointer_click(child_id, true);
+    p.assert_click(child);
+}
+
+#[test]
+fn native_position_nonzero_geometry_and_scale_modes_keep_surface_origin() {
+    for base in [1.0, 1.5] {
+        let mut p = PositionFixture::new(base);
+        let (popup, surface) = p.bookmark((10, -20));
+        position_select_click(&p.conn, popup);
+        p.queue_pointer_click(surface, true);
+        p.assert_click(popup);
+        assert_eq!(
+            (
+                position_x_geometry(&p.conn, popup).0,
+                position_x_geometry(&p.conn, popup).1
+            ),
+            p.project(506.0, 843.0)
+        );
+    }
+}
+
+#[test]
+fn native_position_size_only_and_x_only_requests_preserve_native_y() {
+    let mut p = PositionFixture::new(1.5);
+    let (popup, surface) = p.bookmark((0, 0));
+    let before =
+        p.f.testwl
+            .get_surface_data(surface)
+            .unwrap()
+            .popup()
+            .positioner_state
+            .offset;
+    for values in [
+        vec![x::ConfigWindow::Width(630)],
+        vec![x::ConfigWindow::X(789)],
+    ] {
+        p.conn
+            .send_and_check_request(&x::ConfigureWindow {
+                window: popup,
+                value_list: &values,
+            })
+            .unwrap();
+        p.f.dispatch_until_quiet();
+        let native = p.f.testwl.get_surface_data(surface).unwrap().popup();
+        assert_eq!(native.positioner_state.offset.y, before.y);
+        assert_eq!(
+            native.positioner_state.offset.x,
+            if values.len() == 1 && matches!(values[0], x::ConfigWindow::X(_)) {
+                before.x + 20
+            } else {
+                before.x
+            }
+        );
+        p.f.testwl.configure_popup(surface);
+        p.f.dispatch_until_quiet();
+        assert_eq!(position_x_geometry(&p.conn, popup).1, 1265);
+    }
+}
+
+#[test]
+fn native_position_output_move_then_stationary_popup_click_keeps_local_input() {
+    let mut p = PositionFixture::new(1.5);
+    let (popup, surface) = p.bookmark((0, 0));
+    position_select_click(&p.conn, popup);
+    p.queue_pointer_click(surface, true);
+    p.assert_click(popup);
+    let xdg = p.f.testwl.get_xdg_output(&p.outputs[0]).unwrap();
+    xdg.logical_position(0, 820);
+    xdg.done();
+    p.outputs[0].geometry(
+        0,
+        820,
+        0,
+        0,
+        wl_output::Subpixel::None,
+        "".into(),
+        "".into(),
+        wl_output::Transform::Normal,
+    );
+    p.outputs[0].done();
+    p.position(2, 502.0, 981.0, (0, 0));
+    p.queue_pointer_click(surface, false);
+    p.assert_click(popup);
+    assert_eq!(
+        (
+            position_x_geometry(&p.conn, popup).0,
+            position_x_geometry(&p.conn, popup).1
+        ),
+        (759, 1415)
+    );
+}
+
+#[test]
+fn native_position_fullscreen_repeats_keep_real_right_bottom_pixel_reachable() {
+    let mut p = PositionFixture::new(1.5);
+    position_select_click(&p.conn, p.root);
+    for epoch in 1..=2 {
+        p.f.testwl
+            .configure_toplevel(p.surface, 3440, 1440, vec![xdg_toplevel::State::Fullscreen]);
+        p.position(epoch * 2 - 1, 0.0, 720.0, (0, 0));
+        let pointer = p.f.testwl.pointer();
+        let native = &p.f.testwl.get_surface_data(p.surface).unwrap().surface;
+        pointer.enter(300, native, 3439.5, 1439.5);
+        pointer.motion(300, 3439.5, 1439.5);
+        pointer.frame();
+        pointer.button(301, 301, BTN_LEFT, wl_pointer::ButtonState::Pressed);
+        pointer.frame();
+        pointer.button(302, 302, BTN_LEFT, wl_pointer::ButtonState::Released);
+        pointer.frame();
+        p.f.dispatch_until_quiet();
+        assert_eq!(p.root_geometry(), (0, 1080, 5160, 2160));
+        let actual = p.conn.get_reply(&x::QueryPointer { window: p.root });
+        assert_eq!((actual.win_x(), actual.win_y()), (5159, 2159));
+        match p.conn.await_event() {
+            xcb::Event::X(x::Event::ButtonPress(event)) => {
+                assert_eq!((event.event_x(), event.event_y()), (5159, 2159))
+            }
+            other => panic!("expected fullscreen last-pixel click, got {other:?}"),
+        }
+        p.f.testwl
+            .configure_toplevel(p.surface, 2010, 1083, vec![xdg_toplevel::State::Activated]);
+        p.position(epoch * 2, 502.0, 881.0, (0, 0));
+        p.f.dispatch_until_quiet();
+        assert_eq!((p.root_geometry().0, p.root_geometry().1), (753, 1322));
+    }
+}
+
+#[test]
+fn native_position_common_scaling_off_does_not_bind_extension() {
+    let mut f = Fixture::new_scaled(
+        |wl| wl.enable_position_protocol(),
+        xwls::ScalingConfig {
+            enabled: false,
+            base_scale: Some(1.5),
+        },
+    );
+    let mut conn = Connection::new(&f.display);
+    let root = conn.new_window(conn.root, 0, 0, 200, 160, false);
+    let surface = f.map_as_toplevel(&mut conn, root);
+    f.dispatch_until_quiet();
+    assert!(
+        !f.testwl.position_is_tracked(surface),
+        "legacy coordinates must not consume common-B positions"
+    );
+    assert_eq!(position_x_geometry(&conn, root), (0, 0, 200, 160));
 }

@@ -870,6 +870,7 @@ dependencies = [
  "rustix",
  "rustversion",
  "wayland-protocols",
+ "wayland-scanner",
  "wayland-server",
  "wl_drm",
 ]
@@ -1264,7 +1265,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xwayland-satellite"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -1285,6 +1286,7 @@ dependencies = [
  "vergen-gitcl",
  "wayland-client",
  "wayland-protocols",
+ "wayland-scanner",
  "wayland-server",
  "wl_drm",
  "xcb",

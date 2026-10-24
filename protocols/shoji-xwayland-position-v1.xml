@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="shoji_xwayland_position_v1">
+  <copyright>Copyright 2026 ShojiWM contributors. SPDX-License-Identifier: MPL-2.0</copyright>
+  <interface name="shoji_xwayland_position_manager_v1" version="1">
+    <description summary="ordered position updates for an Xwayland bridge">
+      Private optional compositor extension. Events share the native input connection.
+      A done event commits all preceding state/invalidate events for its epoch after
+      the compositor has queued the corresponding output configuration. The bridge
+      must finish checked X configuration before forwarding subsequent native input.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="get_surface">
+      <arg name="id" type="new_id" interface="shoji_xwayland_position_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+    <event name="done"><arg name="epoch" type="uint"/></event>
+  </interface>
+  <interface name="shoji_xwayland_position_v1" version="1">
+    <description summary="position of one exact native surface lifetime">
+      This object follows the supplied wl_surface lifetime, never its numeric id.
+      x/y describe global logical coordinates of wl_surface local (0,0), excluding
+      compositor decorations. geometry_x/y describe this surface window geometry
+      origin relative to that surface, for xdg_popup parent-relative conversion.
+      No state may be applied until the matching manager done event. An invalidated
+      or destroyed surface cannot reuse a previous origin.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <event name="state">
+      <arg name="epoch" type="uint"/><arg name="x" type="fixed"/><arg name="y" type="fixed"/>
+      <arg name="geometry_x" type="int"/><arg name="geometry_y" type="int"/>
+    </event>
+    <event name="invalidate"><arg name="epoch" type="uint"/></event>
+  </interface>
+</protocol>

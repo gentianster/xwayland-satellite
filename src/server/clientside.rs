@@ -153,6 +153,14 @@ impl std::ops::DerefMut for MyWorld {
 }
 
 impl MyWorld {
+    pub(super) fn push_position_event(
+        &mut self,
+        target: Entity,
+        event: super::position::PositionEvent,
+    ) {
+        self.events.push((target, ObjectEvent::HostPosition(event)));
+    }
+
     pub(crate) fn read_events(&mut self) -> Vec<(Entity, ObjectEvent)> {
         let mut events = std::mem::take(&mut self.events);
         self.queued_events.retain(|rx| {
@@ -191,6 +199,8 @@ delegate_noop!(MyWorld: ZwpTabletManagerV2);
 delegate_noop!(MyWorld: XdgActivationV1);
 delegate_noop!(MyWorld: ZxdgDecorationManagerV1);
 delegate_noop!(MyWorld: WpFractionalScaleManagerV1);
+delegate_noop!(MyWorld: wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
+delegate_noop!(MyWorld: wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
 delegate_noop!(MyWorld: ZwpPrimarySelectionDeviceManagerV1);
 delegate_noop!(MyWorld: WlSubsurface);
 delegate_noop!(MyWorld: WpLinuxDrmSyncobjManagerV1);

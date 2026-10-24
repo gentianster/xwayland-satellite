@@ -4,6 +4,20 @@ This is particularly useful for compositors that (understandably) do not want to
 
 Found a bug? [Open a bug report.](https://github.com/Supreeeme/xwayland-satellite/issues/new?template=bug_report.yaml)
 
+## ShojiWM fork
+
+`main` is the source of truth for this fork, including ShojiWM embedding,
+mixed-DPI handling, and ordered window-position/input synchronization.
+Feature branches are historical development references. New fixes should target
+`main` so standalone and embedded builds use the same implementation.
+ShojiWM pins a satellite Git revision in its own Cargo manifest and lockfile;
+update that pin to a reviewed commit on `main` when adopting changes there.
+A sibling checkout or a branch switch alone does not update the embedded build.
+
+## Motivation
+
+Supporting rootless XWayland involves writing an X11 window manager and dealing with all those quirks. X11's windowing model also does not cleanly map onto Wayland (i.e. there is no absolute positioning support in Wayland) so the compositor would have to do things differently specifically for X11 windows. Also, X11 is just poorly documented in my experience.
+
 ## Building
 
 xwayland-satellite has the following dependencies:
@@ -84,6 +98,11 @@ Some Java applications may present themselves as a blank screen by default with 
 ### Scaling/HiDPI
 For most GTK and Qt apps, xwayland-satellite should automatically scale them properly. Note that for mixed DPI monitor setups, satellite will choose
 the smallest monitor's DPI, meaning apps may have small text on other monitors.
+
+With fractional-scale and xdg-output v3 support, monitor DPI is derived from the
+output's physical and logical sizes. Without xdg-output v3, global X11 DPI uses
+`wl_output.scale` instead: for example, an integer scale of 2 rather than 1.5.
+Individual surfaces still use their fractional preferred scale for viewport sizing.
 
 Other miscellaneous apps (such as Wine apps) may have small text on HiDPI displays. It is application dependent on getting apps to scale properly with satellite,
 so you will have to figure out what app specific config needs to be set. See [the Arch Wiki on HiDPI](https://wiki.archlinux.org/title/HiDPI) for a good place start.

@@ -13,6 +13,9 @@ struct RealData {
     flags: Vec<String>,
 }
 impl xwayland_satellite::RunData for RealData {
+    fn scaling_config(&self) -> xwayland_satellite::ScalingConfig {
+        xwayland_satellite::ScalingConfig::from_env()
+    }
     fn display(&self) -> Option<&str> {
         self.display.as_deref()
     }

@@ -17,7 +17,7 @@ edition = "2024"
 
 [package]
 name = "xwayland-satellite"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Shawn Wallace"]
 license = "MPL-2.0"
 description = "xwayland-satellite grants rootless Xwayland integration to any Wayland compositor implementing xdg_wm_base and viewporter. This is particularly useful for compositors that (understandably) do not want to go through implementing support for rootless Xwayland themselves."
@@ -34,6 +34,7 @@ crate-type = ["lib"]
 bitflags = "2.5.0"
 rustix = { workspace = true, features = ["event"] }
 wayland-client.workspace = true
+wayland-scanner.workspace = true
 wayland-protocols = { workspace = true, features = ["client", "server", "staging", "unstable"] }
 wayland-server.workspace = true
 xcb = { version = "1.7.0", features = ["composite", "randr", "res"] }

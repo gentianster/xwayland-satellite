@@ -51,6 +51,96 @@ use wayland_server::protocol::{
 #[derive(Copy, Clone)]
 pub(super) struct SurfaceScaleFactor(pub f64);
 
+/// Pixel size of a buffer, recorded when Xwayland creates it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) struct BufferSize {
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Nominal cursor size in logical pixels: `XCURSOR_SIZE`, or libXcursor's
+/// default of 24.
+pub(super) fn cursor_base_size() -> i32 {
+    static SIZE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|size| size.trim().parse().ok())
+            .filter(|&size: &i32| size > 0)
+            .unwrap_or(24)
+    })
+}
+
+/// The object a cursor surface was set on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum CursorOwner {
+    Pointer(Entity),
+    TabletTool(Entity),
+}
+
+/// A surface Xwayland has handed to `wl_pointer.set_cursor` or
+/// `zwp_tablet_tool_v2.set_cursor`.
+///
+/// X clients that follow `Xft.dpi` draw their cursors scaled by the same factor
+/// as their windows, and those cursors have to be shrunk back to logical size
+/// like the windows are (with a viewport). Clients that ignore the DPI, or read
+/// a fixed `XCURSOR_SIZE`, draw the nominal size instead, and shrinking those
+/// makes them tiny. Both can happen inside one application (a GTK part and a
+/// self-drawn part, e.g. the Unity editor), so the factor is chosen per cursor
+/// image: `scale` or 1, whichever brings the image closer to the nominal size.
+///
+/// Xwayland sends `set_cursor` before it attaches the image, so the hotspot is
+/// first forwarded with the factor used last and sent again, corrected, when
+/// the image turns out to need the other one.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct CursorSurface {
+    /// X-side scale when the cursor was set.
+    pub scale: f64,
+    pub owner: CursorOwner,
+    pub serial: u32,
+    /// Hotspot in X pixels, as Xwayland sent it.
+    pub hotspot: (i32, i32),
+    /// Factor the forwarded hotspot and viewport are currently divided by.
+    pub factor: f64,
+}
+
+impl CursorSurface {
+    /// Divide by `scale` or by 1, whichever lands closer to `base` in ratio
+    /// terms. Ties go to `scale`, i.e. to trusting the DPI.
+    pub fn factor_for(scale: f64, base: i32, size: BufferSize) -> f64 {
+        let longest = size.width.max(size.height);
+        if scale == 1.0 || longest <= 0 || base <= 0 {
+            return 1.0;
+        }
+        let distance = |factor: f64| (longest as f64 / factor / base as f64).ln().abs();
+        if distance(scale) <= distance(1.0) {
+            scale
+        } else {
+            1.0
+        }
+    }
+
+    /// Viewport destination for an image of `size` X pixels, or `None` to
+    /// leave the viewport unset when nothing is scaled.
+    pub fn destination(&self, size: BufferSize) -> Option<(i32, i32)> {
+        if self.factor == 1.0 || size.width <= 0 || size.height <= 0 {
+            return None;
+        }
+        Some((
+            ((size.width as f64 / self.factor).round() as i32).max(1),
+            ((size.height as f64 / self.factor).round() as i32).max(1),
+        ))
+    }
+
+    /// The hotspot in logical coordinates under the current factor.
+    pub fn logical_hotspot(&self) -> (i32, i32) {
+        (
+            (self.hotspot.0 as f64 / self.factor).round() as i32,
+            (self.hotspot.1 as f64 / self.factor).round() as i32,
+        )
+    }
+}
+
 #[derive(hecs::Bundle)]
 pub(super) struct SurfaceBundle {
     pub client: client::wl_surface::WlSurface,
@@ -102,16 +192,13 @@ impl Event for SurfaceEvents {
                         factor
                     );
 
-                    entity.get::<&mut SurfaceScaleFactor>().unwrap().0 = factor;
+                    entity.get::<&mut SurfaceScaleFactor>().unwrap().0 =
+                        if state.scaling_config.enabled {
+                            state.current_scale
+                        } else {
+                            factor
+                        };
 
-                    if let Some(OnOutput(output)) = entity.get::<&OnOutput>().as_deref().copied() {
-                        if update_output_scale(
-                            state.world.query_one(output).unwrap(),
-                            OutputScaleFactor::Fractional(factor),
-                        ) {
-                            state.updated_outputs.push(output);
-                        }
-                    }
                     if entity.has::<WindowData>() {
                         update_surface_viewport(
                             &state.world,
@@ -192,62 +279,17 @@ impl SurfaceEvents {
         let connection = &mut state.connection;
         let state = &mut state.inner;
 
-        let data = state.world.entity(target).unwrap();
-        let surface = data.get::<&WlSurface>().unwrap();
-        let mut cmd = CommandBuffer::new();
+        let surface = (*state.world.get::<&WlSurface>(target).unwrap()).clone();
         match event {
             Event::Enter { output } => {
                 let output_entity = output.data().copied().unwrap();
-                let Ok(output_data) = state.world.entity(output_entity) else {
+                let Ok(output) = state.world.get::<&WlOutput>(output_entity) else {
                     return;
                 };
-                let Some(output) = output_data.get::<&WlOutput>() else {
-                    return;
-                };
-
                 surface.enter(&output);
-                let on_output = OnOutput(output_entity);
-
                 debug!("{} entered {}", surface.id(), output.id());
-
-                let mut query = data.query::<(&x::Window, &mut WindowData)>();
-                if let Some((window, win_data)) = query.get() {
-                    let Some(dimensions) = output_data.get::<&OutputDimensions>() else {
-                        return;
-                    };
-                    win_data.update_output_offset(
-                        *window,
-                        WindowOutputOffset {
-                            x: dimensions.x - state.global_output_offset.x.value,
-                            y: dimensions.y - state.global_output_offset.y.value,
-                        },
-                        connection,
-                    );
-                    if state.last_focused_toplevel == Some(*window) {
-                        let output = get_output_name(Some(&on_output), &state.world);
-                        debug!("focused window changed outputs - resetting primary output");
-                        connection.focus_window(*window, output);
-                    }
-
-                    if state.fractional_scale.is_none() {
-                        let output_scale = output_data.get::<&OutputScaleFactor>().unwrap().get();
-                        data.get::<&mut SurfaceScaleFactor>().unwrap().0 = output_scale;
-                        drop(query);
-                        update_surface_viewport(
-                            &state.world,
-                            state.world.query_one(target).unwrap(),
-                        );
-                    } else {
-                        let scale = data.get::<&SurfaceScaleFactor>().unwrap();
-                        if update_output_scale(
-                            state.world.query_one(on_output.0).unwrap(),
-                            OutputScaleFactor::Fractional(scale.0),
-                        ) {
-                            state.updated_outputs.push(on_output.0);
-                        }
-                    }
-                }
-                cmd.insert_one(target, on_output);
+                drop(output);
+                update_surface_output_membership(target, output_entity, true, state, connection);
             }
             Event::Leave { output } => {
                 let output_entity = output.data().copied().unwrap();
@@ -255,19 +297,12 @@ impl SurfaceEvents {
                     return;
                 };
                 surface.leave(&output);
-                if data
-                    .get::<&OnOutput>()
-                    .is_some_and(|o| o.0 == output_entity)
-                {
-                    cmd.remove_one::<OnOutput>(target);
-                }
+                drop(output);
+                update_surface_output_membership(target, output_entity, false, state, connection);
             }
             Event::PreferredBufferScale { .. } => {}
             other => warn!("unhandled surface request: {other:?}"),
         }
-
-        drop(surface);
-        cmd.run_on(&mut state.world);
     }
 
     fn xdg_event<C: XConnection>(
@@ -281,6 +316,11 @@ impl SurfaceEvents {
         };
 
         let data = state.world.entity(target).unwrap();
+        let popup_parent = data.get::<&SurfaceRole>().and_then(|role| match &*role {
+            SurfaceRole::Popup(Some(popup)) => Some(popup.parent),
+            _ => None,
+        });
+        let parent_frame = popup_parent.and_then(|parent| state.window_frame(parent));
         let mut xdg = hecs::RefMut::map(data.get::<&mut SurfaceRole>().unwrap(), |r| {
             r.xdg_mut().unwrap()
         });
@@ -291,19 +331,56 @@ impl SurfaceEvents {
         drop(xdg);
 
         if let Some(pending) = pending {
-            let mut query = data.query::<(&SurfaceScaleFactor, &x::Window, &mut WindowData)>();
-            let (scale_factor, window, window_data) = query.get().unwrap();
+            if let Some(SurfaceRole::Popup(Some(popup))) =
+                data.get::<&mut SurfaceRole>().as_deref_mut()
+            {
+                popup.position = Some((pending.x, pending.y));
+            }
+            let mut query = data.query::<(
+                &SurfaceScaleFactor,
+                &x::Window,
+                &mut WindowData,
+                &SurfaceRole,
+            )>();
+            let (scale_factor, window, window_data, role) = query.get().unwrap();
 
             let window = *window;
-            let x = (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x;
-            let y = (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y;
+            let (x, y) = if let Some((parent_dims, parent_scale)) = parent_frame {
+                (
+                    parent_dims.x as i32
+                        + popup_offset(pending.x, parent_scale, state.scaling_config.enabled),
+                    parent_dims.y as i32
+                        + popup_offset(pending.y, parent_scale, state.scaling_config.enabled),
+                )
+            } else if popup_parent.is_some() {
+                (
+                    window_data.attrs.dims.x as i32,
+                    window_data.attrs.dims.y as i32,
+                )
+            } else {
+                (
+                    (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x,
+                    (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y,
+                )
+            };
             let width = if pending.width > 0 {
                 (pending.width as f64 * scale_factor.0) as u16
             } else {
                 window_data.attrs.dims.width
             };
             let height = if pending.height > 0 {
-                (pending.height as f64 * scale_factor.0) as u16
+                let mut logical_height = pending.height;
+                if let SurfaceRole::Toplevel(Some(toplevel)) = role {
+                    if let Some(d) = &toplevel.decoration.satellite {
+                        let surface_width = (width as f64 / scale_factor.0).ceil() as i32;
+                        if d.will_draw_decorations(surface_width) {
+                            logical_height = (logical_height
+                                - DecorationsDataSatellite::TITLEBAR_HEIGHT)
+                                .max(DecorationsDataSatellite::TITLEBAR_HEIGHT);
+                        }
+                    }
+                }
+                (logical_height as f64 * scale_factor.0) as u16
             } else {
                 window_data.attrs.dims.height
             };
@@ -382,6 +459,15 @@ impl SurfaceEvents {
                         if let Some(decorations) = toplevel.decoration.satellite.as_mut() {
                             decorations.handle_fullscreen(toplevel.fullscreen);
                         }
+                    }
+
+                    let prev_max = toplevel.maximized;
+                    toplevel.maximized =
+                        states.contains(&(u32::from(xdg_toplevel::State::Maximized) as u8));
+                    if toplevel.maximized != prev_max {
+                        state
+                            .connection
+                            .set_maximized(*data.get::<&x::Window>().unwrap(), toplevel.maximized);
                     }
                 };
 
@@ -469,20 +555,7 @@ pub(super) fn update_surface_viewport(
     let size_hints = &window_data.attrs.size_hints;
 
     let width = (dims.width as f64 / scale_factor.0).ceil() as i32;
-    let mut height = dims.height;
-    if let Some(SurfaceRole::Toplevel(Some(toplevel))) = role {
-        if let Some(d) = &toplevel.decoration.satellite {
-            let surface_width = (dims.width as f64 / scale_factor.0) as i32;
-            if d.will_draw_decorations(surface_width) {
-                height = height
-                    .saturating_sub(
-                        (DecorationsDataSatellite::TITLEBAR_HEIGHT as f64 * scale_factor.0) as u16,
-                    )
-                    .max(DecorationsDataSatellite::TITLEBAR_HEIGHT as u16);
-            }
-        }
-    }
-    let height = (height as f64 / scale_factor.0).ceil() as i32;
+    let height = (dims.height as f64 / scale_factor.0).ceil() as i32;
     if width > 0 && height > 0 {
         viewport.set_destination(width, height);
     }
@@ -549,8 +622,8 @@ impl Event for client::wl_seat::Event {
     }
 }
 
-struct PendingEnter(client::wl_pointer::Event);
-enum CurrentSurface {
+pub(super) struct PendingEnter(pub(super) client::wl_pointer::Event);
+pub(super) enum CurrentSurface {
     Xwayland(Entity),
     Decoration(Entity),
 }
@@ -561,6 +634,93 @@ impl CurrentSurface {
     }
 }
 pub struct LastClickSerial(pub client::wl_seat::WlSeat, pub u32);
+
+#[derive(Clone)]
+struct LastPointerPosition {
+    surface: Entity,
+    native: Option<WlSurface>,
+    time: u32,
+    x: f64,
+    y: f64,
+    // None means the event preceded a pending X configure.
+    forwarded_frame: Option<(i16, i16, f64)>,
+}
+
+impl LastPointerPosition {
+    fn new(world: &World, pointer: Entity, surface: Entity, time: u32, x: f64, y: f64) -> Self {
+        let native = world
+            .get::<&WlSurface>(surface)
+            .ok()
+            .map(|surface| (*surface).clone());
+        let forwarded_frame = if world.get::<&PendingSurfaceState>(surface).is_ok() {
+            // Retain the known X frame until the pending configure completes.
+            // A size-only configure then needs no redundant motion.
+            world
+                .get::<&LastPointerPosition>(pointer)
+                .ok()
+                .and_then(|previous| {
+                    (previous.surface == surface && previous.native == native)
+                        .then_some(previous.forwarded_frame)
+                        .flatten()
+                })
+        } else {
+            match (
+                world.get::<&WindowData>(surface),
+                world.get::<&SurfaceScaleFactor>(surface),
+            ) {
+                (Ok(data), Ok(scale)) => Some((data.attrs.dims.x, data.attrs.dims.y, scale.0)),
+                _ => None,
+            }
+        };
+        Self {
+            surface,
+            native,
+            time,
+            x,
+            y,
+            forwarded_frame,
+        }
+    }
+}
+
+// Moving a virtual X popup does not move the native pointer. Refresh its last
+// local position only after the checked X configure, without a new enter/grab.
+pub(super) fn refresh_configured_pointers(world: &mut World, configured: &HashSet<Entity>) {
+    let updates = world
+        .query::<(&WlPointer, &CurrentSurface, &LastPointerPosition)>()
+        .iter()
+        .filter_map(|(pointer_entity, (pointer, current, position))| {
+            let CurrentSurface::Xwayland(surface) = current else {
+                return None;
+            };
+            if position.surface != *surface || !configured.contains(surface) {
+                return None;
+            }
+            let data = world.get::<&WindowData>(*surface).ok()?;
+            let scale = world.get::<&SurfaceScaleFactor>(*surface).ok()?;
+            let native = world.get::<&WlSurface>(*surface).ok()?;
+            if !native.is_alive() || position.native.as_ref() != Some(&*native) {
+                return None;
+            }
+            let frame = (data.attrs.dims.x, data.attrs.dims.y, scale.0);
+            if position.forwarded_frame == Some(frame) {
+                return None;
+            }
+            Some((pointer_entity, pointer.clone(), position.clone(), frame))
+        })
+        .collect::<Vec<_>>();
+    for (entity, pointer, position, frame) in updates {
+        world.get::<&mut SurfaceScaleFactor>(entity).unwrap().0 = frame.2;
+        pointer.motion(position.time, position.x * frame.2, position.y * frame.2);
+        if pointer.version() >= 5 {
+            pointer.frame();
+        }
+        world
+            .get::<&mut LastPointerPosition>(entity)
+            .unwrap()
+            .forwarded_frame = Some(frame);
+    }
+}
 
 impl Event for client::wl_pointer::Event {
     fn handle<C: XConnection>(self, target: Entity, state: &mut ServerState<C>) {
@@ -635,6 +795,7 @@ impl Event for client::wl_pointer::Event {
                 else {
                     if let Some(&DecorationMarker { parent }) = surface.data() {
                         drop(query);
+                        let _ = state.world.remove_one::<LastPointerPosition>(target);
                         state
                             .world
                             .insert_one(target, CurrentSurface::Decoration(parent))
@@ -657,7 +818,19 @@ impl Event for client::wl_pointer::Event {
                     if !surface_is_popup {
                         state.last_hovered = Some(*window);
                     }
-                    cmd.insert_one(target, CurrentSurface::Xwayland(surface_entity.unwrap()));
+                    let entity = surface_entity.unwrap();
+                    cmd.insert_one(target, CurrentSurface::Xwayland(entity));
+                    cmd.insert_one(
+                        target,
+                        LastPointerPosition::new(
+                            &state.world,
+                            target,
+                            entity,
+                            0,
+                            surface_x,
+                            surface_y,
+                        ),
+                    );
                 };
 
                 if !surface_is_popup {
@@ -688,6 +861,7 @@ impl Event for client::wl_pointer::Event {
                 cmd.run_on(&mut state.world);
             }
             Self::Leave { serial, surface } => {
+                let _ = state.world.remove_one::<LastPointerPosition>(target);
                 let _ = state.world.remove_one::<PendingEnter>(target);
                 if !surface.is_alive() {
                     return;
@@ -722,7 +896,7 @@ impl Event for client::wl_pointer::Event {
                 if !handle_pending_enter(target, state, "motion") {
                     return;
                 }
-                {
+                let surface_entity = {
                     let Ok(surface) = state.world.get::<&CurrentSurface>(target) else {
                         warn!("could not motion on surface: stale surface");
                         return;
@@ -731,7 +905,33 @@ impl Event for client::wl_pointer::Event {
                         decoration::handle_pointer_motion(state, *parent, surface_x, surface_y);
                         return;
                     }
+                    let CurrentSurface::Xwayland(entity) = *surface else {
+                        unreachable!()
+                    };
+                    entity
+                };
+                let position = LastPointerPosition::new(
+                    &state.world,
+                    target,
+                    surface_entity,
+                    time,
+                    surface_x,
+                    surface_y,
+                );
+                // A DPI change need not be accompanied by another enter.
+                if let Some(scale) = state
+                    .world
+                    .get::<&SurfaceScaleFactor>(surface_entity)
+                    .ok()
+                    .filter(|_| state.scaling_config.enabled)
+                {
+                    state
+                        .world
+                        .get::<&mut SurfaceScaleFactor>(target)
+                        .unwrap()
+                        .0 = scale.0;
                 }
+                state.world.insert_one(target, position).unwrap();
                 let (server, scale) = state
                     .world
                     .query_one_mut::<(&WlPointer, &SurfaceScaleFactor)>(target)
@@ -752,6 +952,9 @@ impl Event for client::wl_pointer::Event {
             } => {
                 if !handle_pending_enter(target, state, "click") {
                     return;
+                }
+                if let Ok(mut position) = state.world.get::<&mut LastPointerPosition>(target) {
+                    position.time = time;
                 }
                 let mut cmd = CommandBuffer::new();
 
@@ -795,6 +998,11 @@ impl Event for client::wl_pointer::Event {
                 cmd.run_on(&mut state.world);
             }
             _ => {
+                if let Self::Axis { time, .. } | Self::AxisStop { time, .. } = &self {
+                    if let Ok(mut position) = state.world.get::<&mut LastPointerPosition>(target) {
+                        position.time = *time;
+                    }
+                }
                 let (server, current_surface) = state
                     .world
                     .query_one_mut::<(&WlPointer, Option<&CurrentSurface>)>(target)
@@ -998,6 +1206,95 @@ impl Event for client::wl_touch::Event {
     }
 }
 
+// Enter reports visibility, not a new primary output. Keep the selected
+// output while it remains entered so overlap does not move the X11 frame
+// into a neighboring output and beyond the X root's input bounds.
+#[derive(Default)]
+pub(super) struct EnteredOutputs(pub(super) Vec<Entity>);
+
+pub(super) fn update_surface_output_membership<C: XConnection>(
+    target: Entity,
+    output: Entity,
+    entered: bool,
+    state: &mut InnerServerState<C::X11Selection>,
+    connection: &mut C,
+) {
+    let previous = state.world.get::<&OnOutput>(target).ok().map(|o| o.0);
+    let mut outputs = state
+        .world
+        .get::<&EnteredOutputs>(target)
+        .map(|o| o.0.clone())
+        .unwrap_or_default();
+    if entered {
+        if !outputs.contains(&output) {
+            outputs.push(output);
+        }
+    } else {
+        outputs.retain(|o| *o != output);
+    }
+    outputs.retain(|o| state.world.get::<&OutputDimensions>(*o).is_ok());
+    let selected = previous
+        .filter(|o| outputs.contains(o))
+        .or_else(|| outputs.first().copied());
+    state
+        .world
+        .insert_one(target, EnteredOutputs(outputs))
+        .unwrap();
+    if previous == selected {
+        return;
+    }
+    let Some(selected) = selected else {
+        // With no visible output, retain the X frame until the next enter,
+        // without treating the previous output as a current membership.
+        let _ = state.world.remove_one::<OnOutput>(target);
+        return;
+    };
+    state.world.insert_one(target, OnOutput(selected)).unwrap();
+    let dimensions = state.world.get::<&OutputDimensions>(selected).unwrap();
+    let data = state.world.entity(target).unwrap();
+    let mut query = data.query::<(&x::Window, &mut WindowData)>();
+    if let Some((window, win_data)) = query.get() {
+        if !state.scaling_config.enabled || scaled_output_batches_ready(&state.world) {
+            let base = if state.scaling_config.enabled {
+                state.current_scale
+            } else {
+                1.0
+            };
+            win_data.update_output_offset(
+                *window,
+                WindowOutputOffset {
+                    x: ((dimensions.x - state.global_output_offset.x.value) as f64 * base).round()
+                        as i32,
+                    y: ((dimensions.y - state.global_output_offset.y.value) as f64 * base).round()
+                        as i32,
+                },
+                data.has::<super::position::Tracking>()
+                    || data
+                        .get::<&SurfaceRole>()
+                        .is_some_and(|role| matches!(*role, SurfaceRole::Popup(_))),
+                connection,
+            );
+        } else {
+            state.scaled_outputs_dirty = true;
+        }
+        if state.last_focused_toplevel == Some(*window) {
+            connection.focus_window(
+                *window,
+                get_output_name(Some(&OnOutput(selected)), &state.world),
+            );
+        }
+        if state.fractional_scale.is_none() && !state.scaling_config.enabled {
+            data.get::<&mut SurfaceScaleFactor>().unwrap().0 = state
+                .world
+                .get::<&OutputScaleFactor>(selected)
+                .unwrap()
+                .get();
+            drop(query);
+            update_surface_viewport(&state.world, state.world.query_one(target).unwrap());
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) struct OnOutput(pub Entity);
 struct OutputName(String);
@@ -1063,6 +1360,20 @@ pub(super) struct OutputDimensions {
     pub width: i32,
     pub height: i32,
     rotated_90: bool,
+    logical_size: Option<(i32, i32)>,
+    geometry: Option<OutputGeometry>,
+    refresh: i32,
+    batch_pending: bool,
+}
+
+#[derive(Clone)]
+struct OutputGeometry {
+    physical_width: i32,
+    physical_height: i32,
+    subpixel: WEnum<client::wl_output::Subpixel>,
+    make: String,
+    model: String,
+    transform: WEnum<client::wl_output::Transform>,
 }
 
 impl Default for OutputDimensions {
@@ -1081,7 +1392,33 @@ impl Default for OutputDimensions {
             width: 0,
             height: 0,
             rotated_90: false,
+            logical_size: None,
+            geometry: None,
+            refresh: 0,
+            batch_pending: true,
         }
+    }
+}
+
+impl OutputDimensions {
+    fn fractional_scale(&self) -> Option<f64> {
+        let (logical_width, logical_height) = self.logical_size?;
+        if self.width <= 0 || self.height <= 0 || logical_width <= 0 || logical_height <= 0 {
+            return None;
+        }
+        let (width, height) = if self.rotated_90 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        // Logical output sizes are rounded to integers. Use the longer axis
+        // and round the estimate to the fractional-scale protocol's 1/120 units.
+        let scale = if logical_width >= logical_height {
+            f64::from(width) / f64::from(logical_width)
+        } else {
+            f64::from(height) / f64::from(logical_height)
+        };
+        Some((scale * 120.0).round().max(1.0) / 120.0)
     }
 }
 
@@ -1131,12 +1468,17 @@ fn update_output_offset(
         );
     }
 
-    update_window_output_offsets(
-        output,
-        &state.global_output_offset,
-        &state.world,
-        connection,
-    );
+    if state.scaling_config.enabled {
+        state.scaled_outputs_dirty = true;
+    } else {
+        update_window_output_offsets(
+            output,
+            &state.global_output_offset,
+            &state.world,
+            connection,
+            1.0,
+        );
+    }
 }
 
 fn update_window_output_offsets(
@@ -1144,25 +1486,133 @@ fn update_window_output_offsets(
     global_output_offset: &GlobalOutputOffset,
     world: &World,
     connection: &mut impl XConnection,
+    base_scale: f64,
 ) {
     let Ok(dimensions) = world.get::<&OutputDimensions>(output) else {
         return;
     };
-    let mut query = world.query::<(&x::Window, &mut WindowData, &OnOutput)>();
+    let mut query = world.query::<(
+        &x::Window,
+        &mut WindowData,
+        &OnOutput,
+        Option<&SurfaceRole>,
+        Option<&super::position::Tracking>,
+    )>();
 
-    for (_, (window, data, _)) in query
+    for (_, (window, data, _, role, position)) in query
         .into_iter()
-        .filter(|(_, (_, _, on_output))| on_output.0 == output)
+        .filter(|(_, (_, _, on_output, _, _))| on_output.0 == output)
     {
         data.update_output_offset(
             *window,
             WindowOutputOffset {
-                x: dimensions.x - global_output_offset.x.value,
-                y: dimensions.y - global_output_offset.y.value,
+                x: ((dimensions.x - global_output_offset.x.value) as f64 * base_scale).round()
+                    as i32,
+                y: ((dimensions.y - global_output_offset.y.value) as f64 * base_scale).round()
+                    as i32,
             },
+            position.is_some() || role.is_some_and(|role| matches!(role, SurfaceRole::Popup(_))),
             connection,
         );
     }
+}
+
+// Common-B projection uses nearest X pixel, including signed offsets. Legacy
+// popup behavior keeps its original truncation when the optional mode is off.
+pub(super) fn popup_offset(logical: i32, scale: f64, common_scale: bool) -> i32 {
+    let pixels = logical as f64 * scale;
+    if common_scale {
+        pixels.round() as i32
+    } else {
+        pixels as i32
+    }
+}
+
+// Keep physical mode/done state intact for DPI derivation. X11 sees a
+// separate, uniformly scaled logical layout, including signed origins.
+pub(super) fn scaled_output_batches_ready(world: &World) -> bool {
+    world
+        .query::<&OutputDimensions>()
+        .iter()
+        .all(|(_, d)| !d.batch_pending)
+}
+
+pub(super) fn refresh_scaled_outputs<C: XConnection>(state: &mut ServerState<C>) -> bool {
+    if !scaled_output_batches_ready(&state.world) {
+        return false;
+    }
+    let base = state.current_scale;
+    let offset = state.global_output_offset;
+    let entities = state
+        .world
+        .query::<&WlOutput>()
+        .iter()
+        .map(|(e, _)| e)
+        .collect::<Vec<_>>();
+    for entity in entities {
+        update_window_output_offsets(
+            entity,
+            &offset,
+            &state.inner.world,
+            &mut state.connection,
+            base,
+        );
+        let Ok(d) = state.world.get::<&OutputDimensions>(entity) else {
+            continue;
+        };
+        let actual = state
+            .world
+            .get::<&OutputScaleFactor>(entity)
+            .map(|s| s.get())
+            .unwrap_or(1.0);
+        let (width, height) = d.logical_size.unwrap_or_else(|| {
+            let (w, h) = if d.rotated_90 {
+                (d.height, d.width)
+            } else {
+                (d.width, d.height)
+            };
+            (
+                (w as f64 / actual).round() as i32,
+                (h as f64 / actual).round() as i32,
+            )
+        });
+        if width <= 0 || height <= 0 {
+            continue;
+        }
+        let x = ((d.x - offset.x.value) as f64 * base).round() as i32;
+        let y = ((d.y - offset.y.value) as f64 * base).round() as i32;
+        let w = (width as f64 * base).round().max(1.0) as i32;
+        let h = (height as f64 * base).round().max(1.0) as i32;
+        let output = state.world.get::<&WlOutput>(entity).unwrap();
+        if let Some(g) = &d.geometry {
+            output.geometry(
+                x,
+                y,
+                g.physical_width,
+                g.physical_height,
+                convert_wenum(g.subpixel),
+                g.make.clone(),
+                g.model.clone(),
+                convert_wenum(g.transform),
+            );
+        }
+        output.mode(
+            wayland_server::protocol::wl_output::Mode::Current,
+            w,
+            h,
+            d.refresh,
+        );
+        output.scale(1);
+        if let Ok(xdg) = state.world.get::<&XdgOutputServer>(entity) {
+            xdg.logical_position(x, y);
+            xdg.logical_size(w, h);
+            if xdg.version() < 3 {
+                xdg.done();
+            }
+        }
+        output.done();
+    }
+    true
 }
 
 pub(super) fn update_global_output_offset(
@@ -1211,7 +1661,7 @@ pub(super) fn update_global_output_offset(
     server.done();
     drop(query);
 
-    update_window_output_offsets(output, global_output_offset, world, connection);
+    update_window_output_offsets(output, global_output_offset, world, connection, 1.0);
 }
 
 #[derive(Debug)]
@@ -1242,12 +1692,53 @@ impl Event for OutputEvent {
 }
 
 impl OutputEvent {
+    fn update_fractional_scale<C: XConnection>(target: Entity, state: &mut ServerState<C>) {
+        // Only v3 commits logical size and wl_output mode/transform together.
+        // Older xdg.done batches cannot be paired reliably with wl_output.done,
+        // so retain their integer output scale instead of mixing generations.
+        if state.fractional_scale.is_none()
+            || !state
+                .world
+                .get::<&zxdg_output_v1::ZxdgOutputV1>(target)
+                .is_ok_and(|xdg| xdg.version() >= 3)
+        {
+            return;
+        }
+        let factor = state
+            .world
+            .get::<&OutputDimensions>(target)
+            .ok()
+            .and_then(|dimensions| dimensions.fractional_scale());
+        if let Some(factor) = factor {
+            if update_output_scale(
+                state.world.query_one(target).unwrap(),
+                OutputScaleFactor::Fractional(factor),
+            ) {
+                state.updated_outputs.push(target);
+            }
+        }
+    }
+
     fn wl_event<C: XConnection>(
         event: client::wl_output::Event,
         target: Entity,
         state: &mut ServerState<C>,
     ) {
         use client::wl_output::Event;
+        let scaled = state.scaling_config.enabled;
+        if scaled {
+            state.scaled_outputs_dirty = true;
+            if matches!(
+                &event,
+                Event::Geometry { .. } | Event::Mode { .. } | Event::Scale { .. }
+            ) {
+                state
+                    .world
+                    .get::<&mut OutputDimensions>(target)
+                    .unwrap()
+                    .batch_pending = true;
+            }
+        }
         match event {
             Event::Geometry {
                 x,
@@ -1283,16 +1774,26 @@ impl OutputEvent {
                     return;
                 };
 
-                output.geometry(
-                    x - global_output_offset.x.value,
-                    y - global_output_offset.y.value,
+                dimensions.geometry = Some(OutputGeometry {
                     physical_width,
                     physical_height,
-                    convert_wenum(subpixel),
-                    make,
-                    model,
-                    convert_wenum(transform),
-                );
+                    subpixel,
+                    make: make.clone(),
+                    model: model.clone(),
+                    transform,
+                });
+                if !scaled {
+                    output.geometry(
+                        x - global_output_offset.x.value,
+                        y - global_output_offset.y.value,
+                        physical_width,
+                        physical_height,
+                        convert_wenum(subpixel),
+                        make,
+                        model,
+                        convert_wenum(transform),
+                    );
+                }
                 dimensions.rotated_90 = transform.into_result().is_ok_and(|t| {
                     matches!(
                         t,
@@ -1302,7 +1803,7 @@ impl OutputEvent {
                             | client::wl_output::Transform::Flipped270
                     )
                 });
-                if let Some(xdg) = xdg {
+                if let Some(xdg) = xdg.filter(|_| !scaled) {
                     if dimensions.rotated_90 {
                         xdg.logical_size(dimensions.height, dimensions.width);
                     } else {
@@ -1329,9 +1830,12 @@ impl OutputEvent {
                 {
                     dimensions.width = width;
                     dimensions.height = height;
+                    dimensions.refresh = refresh;
                     debug!("{} dimensions: {width}x{height}", output.id());
                 }
-                output.mode(convert_wenum(flags), width, height, refresh);
+                if !scaled {
+                    output.mode(convert_wenum(flags), width, height, refresh);
+                }
             }
             Event::Scale { factor } => {
                 debug!(
@@ -1344,7 +1848,7 @@ impl OutputEvent {
                 ) {
                     state.updated_outputs.push(target);
                 }
-                if state.fractional_scale.is_none() {
+                if state.fractional_scale.is_none() && !scaled {
                     state.world.get::<&WlOutput>(target).unwrap().scale(factor);
                 }
             }
@@ -1356,11 +1860,26 @@ impl OutputEvent {
                     .name(name.clone());
                 state.world.insert(target, (OutputName(name),)).unwrap();
             }
+            Event::Done => {
+                // A surface can overlap several outputs, and its preferred
+                // scale need not belong to the last output it entered. Derive
+                // global X11 DPI from output geometry, after its atomic batch.
+                Self::update_fractional_scale(target, state);
+                if scaled {
+                    state
+                        .world
+                        .get::<&mut OutputDimensions>(target)
+                        .unwrap()
+                        .batch_pending = false;
+                }
+                if !scaled {
+                    state.world.get::<&WlOutput>(target).unwrap().done();
+                }
+            }
             _ => simple_event_shunt! {
                 state.world.get::<&WlOutput>(target).unwrap(),
                 event: client::wl_output::Event => [
-                    Description { description },
-                    Done
+                    Description { description }
                 ]
             },
         }
@@ -1372,11 +1891,22 @@ impl OutputEvent {
         state: &mut ServerState<C>,
     ) {
         use zxdg_output_v1::Event;
+        let scaled = state.scaling_config.enabled;
+        if scaled {
+            state.scaled_outputs_dirty = true;
+        }
 
         match event {
             Event::LogicalPosition { x, y } => {
+                if scaled {
+                    state
+                        .world
+                        .get::<&mut OutputDimensions>(target)
+                        .unwrap()
+                        .batch_pending = true;
+                }
                 update_output_offset(target, OutputDimensionsSource::Xdg, x, y, state);
-                if !state.global_offset_updated {
+                if !state.global_offset_updated && !scaled {
                     state
                         .world
                         .get::<&XdgOutputServer>(target)
@@ -1387,17 +1917,32 @@ impl OutputEvent {
                         );
                 }
             }
-            Event::LogicalSize { .. } => {
+            Event::LogicalSize { width, height } => {
                 let Ok((xdg, dimensions)) = state
                     .world
-                    .query_one_mut::<(&XdgOutputServer, &OutputDimensions)>(target)
+                    .query_one_mut::<(&XdgOutputServer, &mut OutputDimensions)>(target)
                 else {
                     return;
                 };
+                dimensions.logical_size = Some((width, height));
+                if scaled {
+                    dimensions.batch_pending = true;
+                    return;
+                }
                 if dimensions.rotated_90 {
                     xdg.logical_size(dimensions.height, dimensions.width);
                 } else {
                     xdg.logical_size(dimensions.width, dimensions.height);
+                }
+            }
+            Event::Done if scaled => {
+                let xdg = state.world.get::<&XdgOutputServer>(target).unwrap();
+                if xdg.version() < 3 {
+                    state
+                        .world
+                        .get::<&mut OutputDimensions>(target)
+                        .unwrap()
+                        .batch_pending = false;
                 }
             }
             _ => simple_event_shunt! {
@@ -1449,6 +1994,27 @@ impl Event for c_dmabuf::zwp_linux_dmabuf_feedback_v1::Event {
 impl Event for zwp_relative_pointer_v1::Event {
     fn handle<C: XConnection>(self, target: Entity, state: &mut ServerState<C>) {
         let server = state.world.get::<&RelativePointerServer>(target).unwrap();
+        if state.scaling_config.enabled {
+            if let Self::RelativeMotion {
+                utime_hi,
+                utime_lo,
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+            } = self
+            {
+                server.relative_motion(
+                    utime_hi,
+                    utime_lo,
+                    dx * state.current_scale,
+                    dy * state.current_scale,
+                    dx_unaccel,
+                    dy_unaccel,
+                );
+            }
+            return;
+        }
         simple_event_shunt! {
             server, self => [
                 RelativeMotion {
